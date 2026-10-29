@@ -114,8 +114,7 @@ def main(cfg: DictConfig):
             state_dict["policy"] = policy.state_dict()
             state_dict["env"] = env.state_dict()
             state_dict["cfg"] = cfg
-            if "vecnorm" in locals():
-                state_dict["vecnorm"] = vecnorm.state_dict()
+            state_dict["vecnorm"] = vecnorm.state_dict()
             torch.save(state_dict, ckpt_path)
             run.save(ckpt_path, policy="now", base_path=run.dir)
             logging.info(f"Saved checkpoint to {str(ckpt_path)}")

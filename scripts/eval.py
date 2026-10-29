@@ -18,6 +18,7 @@ FILE_PATH = os.path.dirname(__file__)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-r", "--run_path", type=str)
+    parser.add_argument("--checkpoint", type=str, help="Local checkpoint path; loads cfg.yaml from the same directory")
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("-p", "--play", action="store_true", default=False)
     # whether to override terrain and command
@@ -31,51 +32,66 @@ def main():
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     args = parser.parse_args()
 
-    api = wandb.Api()
-    
-    run = api.run(args.run_path)
-    print(f"Loading run {run.name}")
-
-    root = os.path.join(os.path.dirname(__file__), "wandb", run.name)
-    os.makedirs(root, exist_ok=True)
-
-    checkpoints = []
-    for file in run.files():
-        print(file.name)
-        if "checkpoint" in file.name:
-            checkpoints.append(file)
-        elif file.name == "cfg.yaml":
-            file.download(root, replace=True)
-        elif file.name == "files/cfg.yaml":
-            file.download(root, replace=True)
-        elif file.name == "config.yaml":
-            file.download(root, replace=True)
-    
-    if args.iterations is None:
-        def sort_by_time(file):
-            number_str = file.name[:-3].split("_")[-1]
-            if number_str == "final":
-                return 100000
-            else:
-                return int(number_str)
-
-        checkpoints.sort(key=sort_by_time)
-        checkpoint = checkpoints[-1]
+    if args.checkpoint is not None:
+        checkpoint_path = os.path.abspath(args.checkpoint)
+        if not os.path.isfile(checkpoint_path):
+            parser.error(f"Checkpoint not found: {checkpoint_path}")
+        root = os.path.dirname(checkpoint_path)
+        cfg_path = os.path.join(root, "cfg.yaml")
+        if not os.path.isfile(cfg_path):
+            parser.error(f"cfg.yaml not found beside checkpoint: {cfg_path}")
+        checkpoint_name = os.path.basename(checkpoint_path)
     else:
-        for file in checkpoints:
-            if file.name == f"checkpoint_{args.iterations}.pt":
-                checkpoint = file
-                break
-    print(f"Downloading {checkpoint.name}")
-    checkpoint.download(root, replace=True)
+        if args.run_path is None:
+            parser.error("provide either --checkpoint for a local run or --run_path for a W&B run")
 
-    try:
-        cfg = OmegaConf.load(os.path.join(root, "files", "cfg.yaml"))
-    except FileNotFoundError:
-        cfg = OmegaConf.load(os.path.join(root, "cfg.yaml"))
+        api = wandb.Api()
+        run = api.run(args.run_path)
+        print(f"Loading run {run.name}")
+
+        root = os.path.join(os.path.dirname(__file__), "wandb", run.name)
+        os.makedirs(root, exist_ok=True)
+
+        checkpoints = []
+        for file in run.files():
+            print(file.name)
+            if "checkpoint" in file.name:
+                checkpoints.append(file)
+            elif file.name == "cfg.yaml":
+                file.download(root, replace=True)
+            elif file.name == "files/cfg.yaml":
+                file.download(root, replace=True)
+            elif file.name == "config.yaml":
+                file.download(root, replace=True)
+
+        if args.iterations is None:
+            def sort_by_time(file):
+                number_str = file.name[:-3].split("_")[-1]
+                return 100000 if number_str == "final" else int(number_str)
+
+            checkpoints.sort(key=sort_by_time)
+            if not checkpoints:
+                parser.error(f"No checkpoints found in W&B run {args.run_path}")
+            checkpoint = checkpoints[-1]
+        else:
+            checkpoint = next(
+                (file for file in checkpoints if file.name == f"checkpoint_{args.iterations}.pt"),
+                None,
+            )
+            if checkpoint is None:
+                parser.error(f"Checkpoint iteration {args.iterations} not found in W&B run {args.run_path}")
+
+        print(f"Downloading {checkpoint.name}")
+        checkpoint.download(root, replace=True)
+        checkpoint_name = checkpoint.name
+
+    cfg_path = os.path.join(root, "cfg.yaml")
+    if not os.path.isfile(cfg_path):
+        cfg_path = os.path.join(root, "files", "cfg.yaml")
+    cfg = OmegaConf.load(cfg_path)
     OmegaConf.set_struct(cfg, False)
 
-    cfg["checkpoint_path"] = os.path.join(root, checkpoint.name)
+    cfg["checkpoint_path"] = os.path.join(root, checkpoint_name)
     cfg["vecnorm"] = "eval"
 
     if args.teleop:
@@ -106,10 +122,10 @@ def main():
         play(cfg)
     else:
         if args.video:
-            cfg["task"]["num_envs"] = 16
+            cfg["task"]["num_envs"] = 1
             cfg["eval_render"] = True
             cfg["app"]["enable_cameras"] = True
-            cfg["app"]["headless"] = False
+            cfg["app"]["headless"] = True
         eval(cfg)
     exit(0)
 

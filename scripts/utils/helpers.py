@@ -253,6 +253,7 @@ def evaluate(
     if len(frames):
         time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
         video_path = os.path.join(os.path.dirname(__file__), "..", "videos/" f"recording-{time_str}.mp4")
+        os.makedirs(os.path.dirname(video_path), exist_ok=True)
         fps = int(1 / env.step_dt)
         try:
             imageio.mimwrite(video_path, frames, fps=fps)

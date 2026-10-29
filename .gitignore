@@ -203,3 +203,5 @@ sim2sim/real_g1/plot
 sim2sim/real_g1/*.npy
 motion.npy
 dataset
+
+Lu 等 - 2025 - GentleHumanoid Learning Upper-body Compliance for Contact-rich Human and Object Interaction.pdf
