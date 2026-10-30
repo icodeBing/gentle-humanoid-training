@@ -37,13 +37,13 @@ command:
   joint_patterns: ["waist_*", ".*_hip_.*", ".*_knee.*", ".*wrist.*"]
   dataset:
     mem_paths:
-      - interx
-      - lafan
-      - amass_fixed
+      - interx_small
+      - lafan_small
+      - amass_small
     path_weights:
-      - 0.4
+      - 0.5
+      - 0.3
       - 0.2
-      - 0.4
   dataset_extra_keys: []
   init_noise:
     root_pos: 0.03
