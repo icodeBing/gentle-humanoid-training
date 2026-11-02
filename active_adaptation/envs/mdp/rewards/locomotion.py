@@ -282,13 +282,13 @@ class joint_pos_limits(Reward):
 
 @reward_func
 def action_rate_l2(self):
-    action_diff = self.action_manager.action_buf[:, :, 0] - self.action_manager.action_buf[:, :, 1]
+    action_buf = self.action_manager.action_buf
+    action_diff = action_buf[:, 0, :] - action_buf[:, 1, :]
     return - action_diff.square().sum(dim=-1, keepdim=True)
 
 
 @reward_func
 def action_rate2_l2(self):
-    action_diff = (
-        self.action_manager.action_buf[:, :, 0] - 2 * self.action_manager.action_buf[:, :, 1] + self.action_manager.action_buf[:, :, 2]
-    )
+    action_buf = self.action_manager.action_buf
+    action_diff = action_buf[:, 0, :] - 2 * action_buf[:, 1, :] + action_buf[:, 2, :]
     return - action_diff.square().sum(dim=-1, keepdim=True)
