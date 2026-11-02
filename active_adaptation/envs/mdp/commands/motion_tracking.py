@@ -463,8 +463,9 @@ class MotionTrackingCommand(Command):
             reward_pos = self.ts_root_pos_w[:, 0].clone()
             reward_quat = self.ts_root_quat_w[:, 0].clone()
             # roll forward the cache
-            self.ts_root_pos_w[:, :-1] = self.ts_root_pos_w[:, 1:]
-            self.ts_root_quat_w[:, :-1] = self.ts_root_quat_w[:, 1:]
+            # Clone the source slice because the destination overlaps it in memory.
+            self.ts_root_pos_w[:, :-1] = self.ts_root_pos_w[:, 1:].clone()
+            self.ts_root_quat_w[:, :-1] = self.ts_root_quat_w[:, 1:].clone()
             # compute target root pos/rot at t+steps
             current_pos_t = self.asset.data.root_pos_w
             current_quat_t = self.asset.data.root_quat_w
