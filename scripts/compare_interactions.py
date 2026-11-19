@@ -21,18 +21,36 @@ def values(rows, key):
 
 def describe_missing_run(path):
     required = ("summary.json", "bodies.csv", "steps.csv")
-    missing = [name for name in required if not (path / name).is_file()]
+    missing = []
+    for name in required:
+        try:
+            exists = (path / name).is_file()
+        except OSError:
+            exists = False
+        if not exists:
+            missing.append(name)
     lines = [f"Run directory is missing required files: {path}",
              f"  Missing: {', '.join(missing)}"]
     parent = path.parent
-    if parent.is_dir():
-        candidates = sorted(child for child in parent.iterdir()
-                            if child.is_dir() and (child / "summary.json").is_file())
+    try:
+        candidates = []
+        if parent.is_dir():
+            for child in parent.iterdir():
+                try:
+                    if child.is_dir() and (child / "summary.json").is_file():
+                        candidates.append(child)
+                except OSError:
+                    continue
+        candidates.sort()
+    except OSError:
+        candidates = []
+        lines.append("  Could not scan sibling directories for suggestions (permission or filesystem error).")
+    if candidates:
         close = difflib.get_close_matches(path.name, [child.name for child in candidates], n=5, cutoff=0.35)
         if close:
             lines.append("  Existing runs in the same parent:")
             lines.extend(f"    {parent / name}" for name in close)
-        elif candidates:
+        else:
             lines.append("  Run directories with summary.json in the same parent:")
             lines.extend(f"    {child}" for child in candidates[:10])
     lines.append("Pass each experiment output directory (the one containing summary.json), not the comparison output directory.")
