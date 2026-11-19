@@ -221,6 +221,32 @@ class ControlledInteractionTests(unittest.TestCase):
             for name in ["comparison.png", "comparison.pdf", "comparison.csv"]:
                 self.assertGreater((root / "comparison" / name).stat().st_size, 100)
 
+            legacy_path = root / "safe5" / "bodies.csv"
+            with legacy_path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            with legacy_path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=[key for key in rows[0] if key != "reference_yielding_m"])
+                writer.writeheader()
+                writer.writerows({key: value for key, value in row.items() if key != "reference_yielding_m"} for row in rows)
+            legacy_result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/compare_interactions.py"), "--runs",
+                 str(root / "baseline"), str(root / "safe5"), "--output", str(root / "legacy-comparison")],
+                capture_output=True, text=True,
+                env=dict(os.environ, MPLCONFIGDIR=str(root / "matplotlib")),
+            )
+            self.assertEqual(legacy_result.returncode, 0, legacy_result.stderr)
+            self.assertIn("lacks reference_yielding_m", legacy_result.stdout)
+
+            missing_result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/compare_interactions.py"), "--runs",
+                 str(root / "basline"), "--output", str(root / "missing-comparison")],
+                capture_output=True, text=True,
+                env=dict(os.environ, MPLCONFIGDIR=str(root / "matplotlib")),
+            )
+            self.assertNotEqual(missing_result.returncode, 0)
+            self.assertIn(str(root / "baseline"), missing_result.stderr)
+            self.assertIn("Missing:", missing_result.stderr)
+
     def test_motion_listing_uses_segment_ids_and_durations(self):
         with tempfile.TemporaryDirectory() as directory:
             dataset = Path(directory) / "motions"
