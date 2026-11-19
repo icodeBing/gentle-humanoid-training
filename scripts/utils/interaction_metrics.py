@@ -4,8 +4,33 @@ import csv
 import json
 import math
 import os
+from collections.abc import Mapping, Sequence
 
 import numpy as np
+
+try:
+    from omegaconf import OmegaConf
+except ImportError:
+    OmegaConf = None
+
+
+def _json_safe(value):
+    if OmegaConf is not None and OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        tensor = value.detach().cpu()
+        return _json_safe(tensor.item() if tensor.numel() == 1 else tensor.tolist())
+    raise TypeError(f"Unsupported value in experiment summary: {type(value).__name__}")
 
 
 def _array(tensor):
@@ -137,7 +162,7 @@ class InteractionRecorder:
             "Position is sampled at time_s; force is the last physics-substep force for the interval starting at force_sample_time_s.",
         ]
         with open(os.path.join(self.directory, "summary.json"), "w") as stream:
-            json.dump(summary, stream, indent=2, allow_nan=False)
+            json.dump(_json_safe(summary), stream, indent=2, allow_nan=False)
         print(f"[Experiment] Saved bodies.csv, joints.csv, steps.csv, summary.json to {self.directory}")
 
     def overlay(self, frame):

@@ -2,6 +2,7 @@
 
 import ast
 import csv
+from collections import UserDict, UserList
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import tempfile
 import subprocess
 import sys
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,11 +182,16 @@ class ControlledInteractionTests(unittest.TestCase):
         c.eval_interaction.apply(0)
         c.asset.data.body_pos_w[0, 5, 2] = -.1
         with tempfile.TemporaryDirectory() as directory:
-            recorder = metrics.InteractionRecorder(c.env, directory)
+            recorder = metrics.InteractionRecorder(
+                c.env, directory,
+                metadata={"seed": np.int64(4), "nested": UserDict({"force_vector": UserList([0., 10., 0.])})},
+            )
             recorder.capture(0, terminated=True, truncated=False)
             recorder.save()
             summary = json.loads((Path(directory) / "summary.json").read_text())
             self.assertTrue(summary["terminated"])
+            self.assertEqual(summary["protocol"]["nested"]["force_vector"], [0., 10., 0.])
+            self.assertEqual(summary["protocol"]["seed"], 4)
             with (Path(directory) / "bodies.csv").open() as stream:
                 row = next(row for row in csv.DictReader(stream) if row["body"] == "right_hand_mimic")
             self.assertEqual(float(row["spring_mag_N"]), 0.)
