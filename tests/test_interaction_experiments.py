@@ -91,7 +91,8 @@ def make_command(mode="spring", safe=10., mass=1., **overrides):
     c.t = torch.zeros(1, dtype=torch.int32)
     c.admit = admittance.AdmittanceMassChain(1, 6, .005, 1, "cpu", mass=.1, damping=2., vel_clip=4., acc_clip=1000.)
     config = dict(mode=mode, safe_force=safe, body="right_hand_mimic", direction=[1., 0., 0.],
-                  stiffness=100., offset=.2, start=0., end=10., ramp=0., load_kg=mass)
+                  force_vector=[0., 10., 0.], stiffness=100., offset=.2,
+                  start=0., end=10., ramp=0., load_kg=mass)
     config.update(overrides)
     c.eval_interaction = interaction_module.EvaluationInteraction(c, config)
     c.cfg = SimpleNamespace(command=SimpleNamespace(dataset=SimpleNamespace(mem_paths=["synthetic"], fix_motion_id=0), motion_start_frame=0))
@@ -138,12 +139,33 @@ class ControlledInteractionTests(unittest.TestCase):
             self.assertAlmostEqual(c.eval_interaction.elapsed, .02)
 
     def test_release_removes_payload_and_baseline_applies_no_force(self):
-        for mode in ["load", "none"]:
+        for mode in ["load", "force", "none"]:
             c = make_command(mode=mode)
             c.eval_interaction.elapsed = 11.
             c.eval_interaction.prepare_targets()
             c.eval_interaction.apply(0)
             self.assertEqual(float(c.force_apply_buffer.abs().sum()), 0.)
+
+    def test_fixed_world_vector_matches_simulation_and_reference(self):
+        c = make_command(mode="force", mass=1.0, safe=5., force_vector=[0., 12., -5.])
+        c.eval_interaction.prepare_targets()
+        expected = torch.tensor([0., 12., -5.])
+        torch.testing.assert_close(c.force_expected_w[0, 5], expected)
+        for substep in range(4):
+            c.eval_interaction.apply(substep)
+            torch.testing.assert_close(c.force_apply_buffer[0, 5], expected)
+            torch.testing.assert_close(c.eval_interaction.total_w[0, 5], expected)
+        self.assertAlmostEqual(float(c.eval_interaction.direction.norm()), 1.)
+
+    def test_constant_force_changes_compliant_reference_with_safe_threshold(self):
+        references = []
+        for safe in [5., 15.]:
+            c = make_command(mode="force", mass=1., safe=safe, force_vector=[0., 10., 0.])
+            for _ in range(200):
+                c.eval_interaction.prepare_targets()
+                c.last_reset_env_ids = None
+            references.append(float(c.force_keypoint_w[0, 5, 1]))
+        self.assertGreater(references[0], references[1] + .05)
 
     def test_fixed_threshold_survives_reset(self):
         c = make_command(safe=5.)

@@ -842,7 +842,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
         self.force_origin_tl.set(env_ids=env_ids, start=pos_b_start, end=pos_b_end, total_steps=transit_steps)
 
-    def force_update_origin_and_target(self, origin_w=None, direction_w=None):
+    def force_update_origin_and_target(self, origin_w=None, direction_w=None, interaction_force_w=None):
         root_pos_w = self.asset.data.root_pos_w.unsqueeze(1)
         root_quat = self.asset.data.root_quat_w
         root_quat_exp = root_quat.unsqueeze(1)
@@ -909,13 +909,19 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                 max=force_limit
             )
             # external force
-            F_ext_b = clamp_norm(
-                self.force_kp_scaled * self.project_pos_diff(
-                    force_origin_b_exp - admit_point_b,
-                    force_dir=force_dir_b_exp,
-                ),
-                self.max_force * self.force_alpha
-            )
+            if interaction_force_w is None:
+                F_ext_b = clamp_norm(
+                    self.force_kp_scaled * self.project_pos_diff(
+                        force_origin_b_exp - admit_point_b,
+                        force_dir=force_dir_b_exp,
+                    ),
+                    self.max_force * self.force_alpha
+                )
+            else:
+                F_ext_b = quat_apply_inverse(
+                    root_quat_exp,
+                    interaction_force_w
+                ).unsqueeze(0)
 
             self.admit.step(F_drive_b=F_drive_b, F_ext_b=F_ext_b)
 
@@ -939,6 +945,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         )
         self.force_expected_b[:] = force_expected_b
         self.force_expected_w[:] = quat_apply(root_quat_exp, force_expected_b)
+        if interaction_force_w is not None:
+            self.force_expected_w[:] = interaction_force_w
+            self.force_expected_b[:] = quat_apply_inverse(root_quat_exp, interaction_force_w)
 
     # this function is for baseline (non-compliant perturbation)
     def force_update_perturb_and_target(self):

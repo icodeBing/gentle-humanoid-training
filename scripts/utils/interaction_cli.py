@@ -6,9 +6,10 @@ import os
 
 def add_interaction_arguments(parser):
     group = parser.add_argument_group("controlled single-policy experiments")
-    group.add_argument("--experiment", choices=["spring", "load", "none"], default=None)
+    group.add_argument("--experiment", choices=["spring", "force", "load", "none"], default=None)
     group.add_argument("--safe-force", type=float, default=None, help="Fixed policy safety input, 5..15 N (default: 10 in experiments).")
     group.add_argument("--load-kg", type=float, default=1.0, help="Equivalent payload mass on ONE hand; load experiment only.")
+    group.add_argument("--force-vector", nargs=3, type=float, default=[0., 10., 0.], metavar=("FX", "FY", "FZ"), help="Fixed world-frame force components in N; force experiment only.")
     group.add_argument("--body", default="right_hand_mimic", choices=["left_hand_mimic", "right_hand_mimic", "left_wrist_roll_link", "right_wrist_roll_link", "left_shoulder_yaw_link", "right_shoulder_yaw_link"])
     group.add_argument("--direction", nargs=3, type=float, default=[1., 0., 0.], help="Spring pull direction in WORLD coordinates; normalized automatically.")
     group.add_argument("--spring-k", type=float, default=100., help="Virtual interaction stiffness in N/m; NOT a robot joint gain.")
@@ -34,14 +35,14 @@ def configure_interaction(args, cfg, parser):
         cfg.task.viewer.lookat = [0.1, 0., 0.35]
     if args.experiment is None:
         if args.safe_force is not None or args.dataset is not None:
-            parser.error("--safe-force / --dataset require --experiment spring, load or none")
+            parser.error("--safe-force / --dataset require --experiment spring, force, load or none")
         return
     if args.play or args.success:
         parser.error("--experiment uses the offline evaluation path; omit --play/--success")
     target = str(cfg.task.command.get("_target_", ""))
     if not target.endswith("MotionTrackingCommand_impedance") or not cfg.task.command.get("compliance", True):
         parser.error("--experiment requires a Gentle/compliant checkpoint and its matching cfg.yaml")
-    values = [args.load_kg, args.spring_k, args.spring_offset, args.force_start, args.force_end, args.force_ramp, args.motion_start, *args.direction]
+    values = [args.load_kg, args.spring_k, args.spring_offset, args.force_start, args.force_end, args.force_ramp, args.motion_start, *args.direction, *args.force_vector]
     if not all(math.isfinite(v) for v in values):
         parser.error("experiment numbers must be finite")
     if args.safe_force is not None and not 5 <= args.safe_force <= 15:
@@ -50,6 +51,8 @@ def configure_interaction(args, cfg, parser):
         parser.error("mass, stiffness, offset, times and motion ID must be nonnegative")
     if sum(v*v for v in args.direction) == 0:
         parser.error("--direction must be a nonzero vector")
+    if args.experiment == "force" and sum(v*v for v in args.force_vector) == 0:
+        parser.error("--force-vector must be nonzero for --experiment force")
     if args.force_end <= args.force_start or 2 * args.force_ramp > args.force_end - args.force_start:
         parser.error("require force-end > force-start and 2*force-ramp <= force-end-force-start")
     if args.experiment == "load" and not args.body.endswith("hand_mimic"):
@@ -73,7 +76,8 @@ def configure_interaction(args, cfg, parser):
     command.eval_interaction = dict(
         mode=args.experiment, safe_force=args.safe_force, body=args.body,
         direction=args.direction, stiffness=args.spring_k, offset=args.spring_offset,
-        start=args.force_start, end=args.force_end, ramp=args.force_ramp, load_kg=args.load_kg,
+        force_vector=args.force_vector, start=args.force_start, end=args.force_end,
+        ramp=args.force_ramp, load_kg=args.load_kg,
     )
     cfg.task.num_envs = 1
     cfg.eval_experiment = True

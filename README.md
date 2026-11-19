@@ -140,9 +140,10 @@ total external force including the independent payload; `bodies.csv` separates i
 
 ### Controlled single-policy compliance experiments
 
-Use `--experiment spring --safe-force 5` to replay a fixed motion with a controlled
-virtual spring, or `--experiment load --load-kg 1.0 --safe-force 10` for a downward
-equivalent payload. Both support `--duration`, `--dataset`, `--motion-id`, force timing,
-video arrows, and separate force/position/torque logs. Use `--experiment none` for an
-unloaded reference. Full commands and interpretation are in
+Use `--experiment force --force-vector 0 10 0 --safe-force 10` to apply a fixed
+world-frame force to an upper-body link and the same force to the compliant reference
+dynamics. `spring` and equivalent `load` modes are also available. These support
+`--duration`, `--dataset`, `--motion-id`, force timing, video arrows, and separate
+force/position/torque logs. Use `--experiment none` for an unloaded reference. Full
+commands and interpretation are in
 [单策略上肢柔顺实验说明](docs/interaction_experiments_zh.md).

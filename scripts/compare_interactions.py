@@ -57,21 +57,30 @@ def main():
     for label, summary, rows, steps in runs:
         time = values(rows, "time_s")
         params = summary["interaction"]
-        is_load = params["mode"] == "load"
-        force_key = "load_mag_N" if is_load else "spring_mag_N"
+        is_external = params["mode"] in ("load", "force")
+        force_key = "external_force_mag_N" if is_external else "spring_mag_N"
         curve, = axes[0].plot(time, values(rows, force_key), label=label)
         color = curve.get_color()
-        if not is_load and params["mode"] != "none":
+        if not is_external and params["mode"] != "none":
             axes[0].plot(time, values(rows, "safe_limit_N"), "--", color=color, alpha=.5)
         yielding = values(rows, "yielding_m")
         if baseline is not None:
             # Recompute the no-load baseline displacement along THIS run's direction.
-            direction = np.array([0., 0., -1.]) if is_load else np.array(params["direction"], dtype=float)
+            direction = (np.array(params["force_vector"], dtype=float) if params["mode"] == "force"
+                         else np.array([0., 0., -1.]) if params["mode"] == "load"
+                         else np.array(params["direction"], dtype=float))
             direction /= np.linalg.norm(direction)
             baseline_displacement = np.stack([values(baseline, f"actual_{axis}_m")-values(baseline, f"reference_{axis}_m") for axis in "xyz"], axis=1) @ direction
             baseline_times = values(baseline, "time_s")
             yielding -= np.interp(time, baseline_times, baseline_displacement, left=np.nan, right=np.nan)
-        axes[1].plot(time, 100*yielding, label=label, color=color)
+        axes[1].plot(time, 100*yielding, label=f"{label} actual", color=color)
+        ref_yielding = values(rows, "reference_yielding_m")
+        if baseline is not None:
+            ref_yielding -= np.interp(time, values(baseline, "time_s"),
+                                      values(baseline, "reference_yielding_m"),
+                                      left=np.nan, right=np.nan)
+        axes[1].plot(time, 100*ref_yielding, label=f"{label} compliant reference",
+                     color=color, linestyle="--", alpha=.8)
         axes[2].plot(time, 100*values(rows, "tracking_error_m"), label=label, color=color)
         axes[3].plot(time, 100*values(rows, "root_error_m"), label=label, color=color)
         axes[4].plot(values(steps, "time_s"), values(steps, "arm_peak_torque_Nm"), label=label, color=color)
@@ -80,8 +89,8 @@ def main():
             comparison.append(dict(run=label, phase=phase, terminated=summary["terminated"],
                                    duration_s=summary["recorded_duration_s"], **metrics))
         print(f"{label}: {summary['recorded_duration_s']:.2f}s, terminated={summary['terminated']}; phases={list(summary['phases'])}")
-    titles = ["Applied spring / payload force (N); dashed: safety input",
-              "Displacement along force (cm)" + (" minus unloaded baseline" if baseline else " relative to original motion"),
+    titles = ["Applied spring / fixed external force (N); dashed: safety input",
+              "Force-direction yield (cm); solid: robot, dashed: compliant reference" + (" minus unloaded baseline" if baseline else " relative to original motion"),
               "Selected link tracking error vs original motion (cm)",
               "Root position error vs original motion (cm)",
               "Peak absolute arm joint actuator torque (Nm)", "Torso tilt from vertical (deg)"]

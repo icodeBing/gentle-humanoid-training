@@ -44,7 +44,7 @@ class InteractionRecorder:
         torso = _array(c.asset.data.body_pos_w[0, c.torso_idx_asset])
         torso_ref = _array(c._motion.body_pos_w[0, 0, c.torso_idx_motion] + self.env.scene.env_origins[0])
         limit = float(c.force_safe_limit_tl.current[0, 0])
-        direction = _array(interaction.direction) if p["mode"] != "load" else np.array([0., 0., -1.])
+        direction = _array(interaction.direction)
         common = dict(step=step, time_s=time_s, force_sample_time_s=sample_time, phase=phase,
                       pulse_scale=interaction.applied_scale, safe_limit_N=limit,
                       root_error_m=root_error, torso_error_m=float(np.linalg.norm(torso-torso_ref)),
@@ -60,12 +60,15 @@ class InteractionRecorder:
             expected = _array(c.force_expected_w[0, fi]) if fi is not None else np.zeros(3)
             row = dict(common, body=name, spring_mag_N=float(np.linalg.norm(spring)),
                        load_mag_N=float(np.linalg.norm(load)), total_mag_N=float(np.linalg.norm(spring+load)),
+                       external_force_mag_N=float(np.linalg.norm(load)),
                        expected_spring_mag_N=float(np.linalg.norm(expected)),
                        spring_exceeds_limit=int(np.linalg.norm(spring) > limit),
                        tracking_error_m=float(np.linalg.norm(actual-reference)),
                        aligned_tracking_error_m=float(np.linalg.norm(actual-aligned)),
                        compliant_target_error_m=float(np.linalg.norm(actual-target)),
-                       yielding_m=float(np.dot(actual-reference, direction)))
+                       yielding_m=float(np.dot(actual-reference, direction)),
+                       reference_yielding_m=float(np.dot(target-reference, direction)),
+                       actual_minus_target_along_force_m=float(np.dot(actual-target, direction)))
             for label, values in [("actual", actual), ("reference", reference), ("aligned_reference", aligned),
                                   ("compliant_target", target), ("spring", spring), ("load", load), ("total", spring+load),
                                   ("root", root), ("root_reference", raw_root), ("torso", torso), ("torso_reference", torso_ref)]:
@@ -115,6 +118,8 @@ class InteractionRecorder:
             summary["phases"][phase] = dict(
                 samples=len(rows),
                 peak_spring_N=max(row["spring_mag_N"] for row in rows),
+                peak_external_force_N=max(row["external_force_mag_N"] for row in rows),
+                peak_total_force_N=max(row["total_mag_N"] for row in rows),
                 spring_exceed_fraction=float(np.mean([row["spring_exceeds_limit"] for row in rows])),
                 spring_exceed_duration_s=sum(row["spring_exceeds_limit"] for row in rows)*self.env.step_dt,
                 tracking_rmse_m=float(np.sqrt(np.mean([row["tracking_error_m"]**2 for row in rows]))),
@@ -194,8 +199,8 @@ class InteractionRecorder:
         phase = self.steps[-1]["phase"] if self.steps else "before"
         text = (f"{interaction.config['mode']} | {phase} | t={interaction.elapsed:.2f}s | "
                 f"safe={float(c.force_safe_limit_tl.current[0, 0]):.1f}N | "
-                f"load={interaction.config['load_kg'] if interaction.config['mode']=='load' else 0:g}kg\n"
-                "RED: original motion arm | GREEN: compliant target | BLUE: spring | YELLOW: mg (0.015m/N)")
+                f"external={np.linalg.norm(_array(interaction.load_w[0, interaction.body])):.1f}N\n"
+                "RED: original motion arm | GREEN: compliant target | BLUE: spring | YELLOW: fixed external force (0.015m/N)")
         draw.rectangle((6, h-55, w-6, h-5), fill=(15, 15, 15))
         draw.text((14, h-50), text, fill=(255, 255, 255))
         return np.asarray(image)
