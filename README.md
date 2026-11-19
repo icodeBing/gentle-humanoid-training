@@ -119,3 +119,19 @@ Such adjustments may increase training time and could affect training performanc
 python scripts/eval.py --run_path ${wandb_run_path} -p # p for play
 python scripts/eval.py --run_path ${wandb_run_path} -p --export # export the policy to onnx (sim2real)
 ```
+
+### Visualizing the external force during replay
+
+`--video` runs headless, so the viewport-only debug arrows are not recorded. Add
+`--show-force` to burn the applied force into the frames and dump it to a csv:
+
+```bash
+python scripts/eval.py --checkpoint <run_dir>/files/checkpoint_final.pt --video --show-force
+# -> scripts/videos/recording-<time>.mp4
+# -> scripts/videos/force-<time>.csv   (step, time, body, fx, fy, fz, |F|, |F_expected|, safe_limit)
+```
+
+The quantity shown is `command_manager.force_applied_w` (`[num_envs, 6, 3]`, world frame,
+Newton): the virtual spring force applied to `shoulder_yaw`, `wrist_roll` and `hand_mimic`
+of both arms at every physics substep (see `MotionTrackingCommand_impedance.force_apply`).
+In a GUI run (`-p`) the same quantity is already drawn as blue arrows by `debug_draw`.

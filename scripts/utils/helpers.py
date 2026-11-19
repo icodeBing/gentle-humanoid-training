@@ -6,6 +6,7 @@ import time
 import wandb
 import logging
 import os
+import csv
 import datetime
 
 from typing import Sequence
@@ -191,6 +192,171 @@ def make_env_policy(cfg: DictConfig):
 from torchrl.envs import TransformedEnv, ExplorationType, set_exploration_type
 from tqdm import tqdm
 
+# --------------------------------------------------------------------------------------
+# External force visualization
+#
+# `MotionTrackingCommand_impedance` pushes the robot hands/arms with a virtual spring at
+# every physics substep (see `force_apply`). The force that is actually handed to PhysX is
+# stored in `command_manager.force_applied_w`
+# ([num_envs, num_force_bodies, 3], world frame, Newton).
+#
+# The helpers below make that quantity visible in a headless `--video` replay:
+#   * a HUD with per-body force components / magnitude / expected value,
+#   * a rolling |F| curve per body at the bottom of the frame,
+#   * a csv next to the video for offline plotting.
+# --------------------------------------------------------------------------------------
+
+_FORCE_COLORS = [
+    (255, 90, 90),
+    (90, 170, 255),
+    (90, 230, 140),
+    (255, 200, 70),
+    (210, 130, 255),
+    (80, 220, 220),
+]
+
+
+def _force_snapshot(base_env, env_index: int | None = None):
+    """Read the force the environment currently applies to the robot.
+
+    Returns ``None`` when the task does not apply external forces (e.g. locomotion).
+    """
+    command = getattr(base_env, "command_manager", None)
+    if command is None or not hasattr(command, "force_applied_w"):
+        return None
+
+    if env_index is None:
+        env_index = int(getattr(base_env, "lookat_env_i", 0))
+
+    applied = command.force_applied_w[env_index].detach().float().cpu().numpy()
+
+    expected = None
+    if hasattr(command, "force_expected_w"):
+        expected = command.force_expected_w[env_index].detach().float().cpu().numpy()
+
+    limit = float("nan")
+    if hasattr(command, "force_safe_limit_tl"):
+        limit = float(command.force_safe_limit_tl.current[env_index].reshape(-1)[0])
+
+    indices = command.force_apply_idx_asset
+    indices = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+    names = [str(command.asset.body_names[i]).replace("_link", "") for i in indices]
+
+    return {
+        "applied": applied,                                                  # [M, 3]
+        "expected": expected,                                                # [M, 3] | None
+        "magnitudes": np.linalg.norm(applied, axis=-1),                      # [M]
+        "limit": limit,                                                      # scalar
+        "names": names,
+    }
+
+
+def _draw_force_chart(frame: np.ndarray, history, height: int = 170, pad: int = 12):
+    """Rolling |F| curve per force body, drawn at the bottom of the frame."""
+    mag = np.stack(history["mag"], axis=0)                                   # [T, M]
+    if mag.shape[0] < 2:
+        return frame, max(1.0, float(mag.max()))
+
+    limit = np.asarray(history["limit"], dtype=np.float32)                   # [T]
+    has_limit = np.isfinite(limit).any()
+
+    limit_values = limit[np.isfinite(limit)]
+    ymax = max(1.0, float(mag.max()) * 1.15)
+    if limit_values.size:
+        ymax = max(ymax, float(limit_values.max()) * 1.15)
+
+    h, w = frame.shape[:2]
+    height = int(min(height, h // 3))
+    top = h - height
+    frame[top:h] = (frame[top:h].astype(np.float32) * 0.35).astype(np.uint8)
+    frame[top, pad:w - pad] = (90, 90, 90)
+
+    plot_top, plot_bottom = top + pad, h - pad - 1
+    xs = np.linspace(pad, w - pad - 1, mag.shape[0]).astype(np.int32)
+    cols = np.arange(pad, w - pad - 1, dtype=np.int32)
+
+    def value_to_row(values):
+        values = np.clip(np.nan_to_num(values) / ymax, 0.0, 1.0)
+        return (plot_bottom - values * (plot_bottom - plot_top)).round().astype(np.int32)
+
+    def draw_curve(rows, color, thickness: int = 1):
+        rows = np.interp(cols, xs, rows).round().astype(np.int32)
+        for dy in range(-thickness, thickness + 1):
+            frame[np.clip(rows + dy, top + 1, h - 1), cols] = color
+
+    if has_limit:
+        limit_rows = value_to_row(limit)
+        for i in range(0, len(cols) - 4, 8):
+            frame[np.clip(np.interp(cols[i:i + 4], xs, limit_rows).round().astype(np.int32), top + 1, h - 1),
+                  cols[i:i + 4]] = (130, 130, 130)
+
+    for m in range(mag.shape[1]):
+        draw_curve(value_to_row(mag[:, m]), _FORCE_COLORS[m % len(_FORCE_COLORS)], thickness=1)
+
+    return frame, ymax
+
+
+def _overlay_force_text(frame: np.ndarray, snap, step: int, time_s: float, ymax: float):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return frame
+
+    lines, colors = [], []
+
+    def add(text, color=(255, 255, 255)):
+        lines.append(text)
+        colors.append(tuple(int(c) for c in color))
+
+    add(f"external force  t={time_s:6.2f}s  step={step:4d}  chart ymax={ymax:5.1f}N")
+    for m, name in enumerate(snap["names"]):
+        fx, fy, fz = snap["applied"][m]
+        text = f"{name:<22s} ({fx:+6.2f},{fy:+6.2f},{fz:+6.2f})N  |F|={snap['magnitudes'][m]:6.2f}N"
+        if snap["expected"] is not None:
+            text += f"  |Fexp|={float(np.linalg.norm(snap['expected'][m])):6.2f}N"
+        add(text, _FORCE_COLORS[m % len(_FORCE_COLORS)])
+    add(f"safe force limit = {snap['limit']:5.2f}N", (200, 200, 200))
+
+    image = Image.fromarray(frame)
+    draw = ImageDraw.Draw(image, "RGBA")
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    line_height = 17
+    try:
+        widths = [draw.textbbox((0, 0), line, font=font)[2] for line in lines]
+    except Exception:
+        widths = [len(line) * 7 for line in lines]
+    panel_w = max(widths) + 20
+    panel_h = len(lines) * line_height + 12
+    draw.rectangle([6, 6, 6 + panel_w, 6 + panel_h], fill=(0, 0, 0, 150))
+
+    y = 12
+    for line, color in zip(lines, colors):
+        draw.text((14, y), line, font=font, fill=color + (255,))
+        y += line_height
+
+    return np.array(image)
+
+
+def _overlay_force(frame: np.ndarray, snap, step: int, time_s: float, history):
+    frame = np.array(frame, copy=True)
+    frame, ymax = _draw_force_chart(frame, history)
+    return _overlay_force_text(frame, snap, step, time_s, ymax)
+
+
+def _write_force_csv(path: str, records):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "step", "time_s", "body",
+            "fx_N", "fy_N", "fz_N", "f_mag_N", "f_expected_mag_N", "safe_limit_N",
+        ])
+        writer.writerows(records)
+
+
 @torch.inference_mode()
 def evaluate(
     env: TransformedEnv,
@@ -199,10 +365,13 @@ def evaluate(
     exploration_type: ExplorationType=ExplorationType.MODE,
     render=False,
     keys=[("next", "stats")],
+    show_force: bool = False,
 ):
     """
     Evaluate the policy on the environment, selecting `keys` from the trajectory.
     If `render` is True, record and save the video.
+    If `show_force` is True, draw the external force applied to the robot on the video
+    and dump it to a csv next to the video.
     """
     keys = set(keys)
     keys.add(("next", "done"))
@@ -213,6 +382,10 @@ def evaluate(
     tensordict_ = env.reset()
     trajs = []
     frames = []
+
+    force_records = []
+    force_history = {"mag": [], "limit": []}
+    force_max_history = 400
 
     inference_time = []
     torch.compiler.cudagraph_mark_step_begin()
@@ -225,7 +398,27 @@ def evaluate(
             tensordict, tensordict_ = env.step_and_maybe_reset(tensordict_)
             trajs.append(tensordict.select(*keys, strict=False).cpu())
             if render:
-                frames.append(env.render("rgb_array"))
+                frame = env.render("rgb_array")
+                snap = _force_snapshot(env.base_env) if show_force else None
+                if snap is not None:
+                    time_s = (i + 1) * env.step_dt
+                    force_history["mag"].append(snap["magnitudes"].copy())
+                    force_history["limit"].append(snap["limit"])
+                    for key in ("mag", "limit"):
+                        if len(force_history[key]) > force_max_history:
+                            force_history[key].pop(0)
+                    frame = _overlay_force(frame, snap, i, time_s, force_history)
+                    for m, name in enumerate(snap["names"]):
+                        fx, fy, fz = (float(v) for v in snap["applied"][m])
+                        exp = float(np.linalg.norm(snap["expected"][m])) if snap["expected"] is not None else float("nan")
+                        force_records.append([
+                            i, round(time_s, 4), name,
+                            round(fx, 4), round(fy, 4), round(fz, 4),
+                            round(float(snap["magnitudes"][m]), 4),
+                            round(exp, 4),
+                            round(float(snap["limit"]), 4),
+                        ])
+                frames.append(frame)
     inference_time = np.mean(inference_time[5:])
     print(f"Average inference time: {inference_time:.4f} s")
 
@@ -250,10 +443,11 @@ def evaluate(
             info[key + "_std"] = torch.std(v.float()).item()
 
     # log video
+    time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
+    video_dir = os.path.join(os.path.dirname(__file__), "..", "videos")
     if len(frames):
-        time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
-        video_path = os.path.join(os.path.dirname(__file__), "..", "videos/" f"recording-{time_str}.mp4")
-        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        os.makedirs(video_dir, exist_ok=True)
+        video_path = os.path.join(video_dir, f"recording-{time_str}.mp4")
         fps = int(1 / env.step_dt)
         try:
             imageio.mimwrite(video_path, frames, fps=fps)
@@ -261,6 +455,15 @@ def evaluate(
             # Fallback: ensure frames are numpy arrays
             video_array = np.stack(frames)
             imageio.mimwrite(video_path, list(video_array), fps=fps)
+        print(f"video saved to {os.path.abspath(video_path)}")
+
+    if len(force_records):
+        os.makedirs(video_dir, exist_ok=True)
+        csv_path = os.path.join(video_dir, f"force-{time_str}.csv")
+        _write_force_csv(csv_path, force_records)
+        peak = max(row[6] for row in force_records)
+        info["force/peak"] = peak
+        print(f"force log saved to {os.path.abspath(csv_path)} (peak |F| = {peak:.2f} N)")
 
     info["episode_cnt"] = episode_cnt
     return dict(sorted(info.items())), trajs, stats

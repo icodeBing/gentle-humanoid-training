@@ -28,6 +28,9 @@ def main():
     
     parser.add_argument("-e", "--export", action="store_true", default=False)
     parser.add_argument("-v", "--video", action="store_true", default=False)
+    parser.add_argument("--show-force", action="store_true", default=False,
+                        help="Overlay the external force applied to the robot on the recorded video "
+                             "and dump it to a csv (only used together with --video).")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     args = parser.parse_args()
@@ -126,6 +129,9 @@ def main():
             cfg["eval_render"] = True
             cfg["app"]["enable_cameras"] = True
             cfg["app"]["headless"] = True
+            cfg["eval_show_force"] = args.show_force
+        elif args.show_force:
+            print("[Warn] --show-force only has an effect together with --video.")
         eval(cfg)
     exit(0)
 

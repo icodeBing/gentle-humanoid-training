@@ -44,7 +44,13 @@ def eval(cfg):
     ]
     
     policy_eval = agent.get_rollout_policy("eval")
-    info, trajs, stats = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed, keys=keys)
+    info, trajs, stats = evaluate(
+        env, policy_eval,
+        render=cfg.eval_render,
+        seed=cfg.seed,
+        keys=keys,
+        show_force=cfg.get("eval_show_force", False),
+    )
     
     print(termcolor.colored(trajs, "light_yellow"))
     time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
