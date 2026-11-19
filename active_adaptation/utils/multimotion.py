@@ -43,6 +43,11 @@ class ProgressiveMultiMotionDataset:
         w = torch.tensor(path_weights, dtype=torch.double)
         self.probs = (w / w.sum()).float().to(device)
         self.counts = [ds.num_motions for ds in self.datasets]
+        if fix_ds is not None and not 0 <= fix_ds < len(self.datasets):
+            raise ValueError(f"fix_ds={fix_ds} outside dataset range")
+        selected_counts = self.counts if fix_ds is None else [self.counts[fix_ds]]
+        if fix_motion_id is not None and any(not 0 <= fix_motion_id < count for count in selected_counts):
+            raise ValueError(f"fix_motion_id={fix_motion_id} outside selected dataset motion counts {selected_counts}")
 
         self._buf_A = self._allocate_empty_buffer()
         self._len_A = torch.zeros(env_size, dtype=torch.int32, device=device)

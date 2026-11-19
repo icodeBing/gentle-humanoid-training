@@ -229,10 +229,15 @@ def _force_snapshot(base_env, env_index: int | None = None):
         env_index = int(getattr(base_env, "lookat_env_i", 0))
 
     applied = command.force_applied_w[env_index].detach().float().cpu().numpy()
+    interaction = getattr(command, "eval_interaction", None)
+    if interaction is not None:
+        applied = interaction.total_w[env_index].detach().float().cpu().numpy()
 
     expected = None
     if hasattr(command, "force_expected_w"):
         expected = command.force_expected_w[env_index].detach().float().cpu().numpy()
+    if interaction is not None and interaction.config["mode"] == "load":
+        expected = None
 
     limit = float("nan")
     if hasattr(command, "force_safe_limit_tl"):
@@ -315,7 +320,7 @@ def _overlay_force_text(frame: np.ndarray, snap, step: int, time_s: float, ymax:
         if snap["expected"] is not None:
             text += f"  |Fexp|={float(np.linalg.norm(snap['expected'][m])):6.2f}N"
         add(text, _FORCE_COLORS[m % len(_FORCE_COLORS)])
-    add(f"safe force limit = {snap['limit']:5.2f}N", (200, 200, 200))
+    add(f"policy safety input = {snap['limit']:5.2f}N (not a hard force clamp)", (200, 200, 200))
 
     image = Image.fromarray(frame)
     draw = ImageDraw.Draw(image, "RGBA")
@@ -366,6 +371,8 @@ def evaluate(
     render=False,
     keys=[("next", "stats")],
     show_force: bool = False,
+    output_dir: str | None = None,
+    experiment_metadata: dict | None = None,
 ):
     """
     Evaluate the policy on the environment, selecting `keys` from the trajectory.
@@ -380,6 +387,21 @@ def evaluate(
     env.set_seed(seed)
 
     tensordict_ = env.reset()
+    command = env.base_env.command_manager
+    interaction = getattr(command, "eval_interaction", None)
+    recorder = None
+    if interaction is not None:
+        from scripts.utils.interaction_metrics import InteractionRecorder
+        if output_dir is None:
+            raise ValueError("Controlled evaluation requires an output directory")
+        recorder = InteractionRecorder(env.base_env, output_dir, experiment_metadata)
+        # BaseEnv normally randomizes episode ages for training; start this test at zero.
+        env.base_env.episode_length_buf.zero_()
+        command.t.sub_(1)
+        command.before_update()
+        command.update()
+        available = (int(command.lengths[0]) - int(command.t[0]) - 1) * env.step_dt
+        print(f"[Experiment] Available motion duration: {available:.2f}s; recording stops at the first episode end.")
     trajs = []
     frames = []
 
@@ -395,7 +417,14 @@ def evaluate(
             tensordict_ = policy(tensordict_)
             e = time.perf_counter()
             inference_time.append(e - s)
-            tensordict, tensordict_ = env.step_and_maybe_reset(tensordict_)
+            if recorder is None:
+                tensordict, tensordict_ = env.step_and_maybe_reset(tensordict_)
+            else:
+                from torchrl.envs.utils import step_mdp
+                tensordict = env.step(tensordict_)
+                tensordict_ = step_mdp(tensordict, keep_other=True)
+                recorder.capture(i, bool(tensordict["next", "terminated"].any()),
+                                 bool(tensordict["next", "truncated"].any()))
             trajs.append(tensordict.select(*keys, strict=False).cpu())
             if render:
                 frame = env.render("rgb_array")
@@ -418,14 +447,21 @@ def evaluate(
                             round(exp, 4),
                             round(float(snap["limit"]), 4),
                         ])
+                if recorder is not None:
+                    frame = recorder.overlay(frame)
                 frames.append(frame)
-    inference_time = np.mean(inference_time[5:])
+            if recorder is not None and tensordict["next", "done"].any():
+                break
+    if recorder is not None:
+        recorder.save()
+    inference_time = np.mean(inference_time[5:] or inference_time)
     print(f"Average inference time: {inference_time:.4f} s")
 
     trajs: TensorDictBase = torch.stack(trajs, dim=1)
     done = trajs.get(("next", "done"))
     episode_cnt = len(done.nonzero())
     first_done = torch.argmax(done.long(), dim=1).cpu()
+    first_done = torch.where(done.any(dim=1).cpu(), first_done, torch.full_like(first_done, done.shape[1]-1))
 
     def take_first_episode(tensor: torch.Tensor):
         indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
@@ -440,11 +476,11 @@ def evaluate(
         stats[key] = v
         info[key] = torch.mean(v.float()).item()
         if k in compute_std_for:
-            info[key + "_std"] = torch.std(v.float()).item()
+            info[key + "_std"] = torch.std(v.float(), unbiased=False).item()
 
     # log video
-    time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
-    video_dir = os.path.join(os.path.dirname(__file__), "..", "videos")
+    time_str = datetime.datetime.now().strftime("%m-%d_%H-%M-%S-%f")
+    video_dir = output_dir or os.path.join(os.path.dirname(__file__), "..", "videos")
     if len(frames):
         os.makedirs(video_dir, exist_ok=True)
         video_path = os.path.join(video_dir, f"recording-{time_str}.mp4")

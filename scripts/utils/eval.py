@@ -27,6 +27,21 @@ def eval(cfg):
     app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
     simulation_app = app_launcher.app
 
+    output_dir = cfg.get("eval_output_dir")
+    if cfg.get("eval_experiment", False):
+        if not output_dir:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            output_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs_eval", stamp))
+        os.makedirs(output_dir, exist_ok=True)
+        if os.path.exists(os.path.join(output_dir, "summary.json")):
+            raise FileExistsError(f"Experiment already exists in {output_dir}; choose a new --output-dir")
+        OmegaConf.save(cfg, os.path.join(output_dir, "eval_cfg.yaml"))
+        # Dataset sampling and startup randomization occur during environment construction.
+        import random
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+
     env, agent, vecnorm, _ = make_env_policy(cfg)
     
     keys = [
@@ -50,6 +65,8 @@ def eval(cfg):
         seed=cfg.seed,
         keys=keys,
         show_force=cfg.get("eval_show_force", False),
+        output_dir=output_dir,
+        experiment_metadata=dict(checkpoint_path=cfg.checkpoint_path, seed=cfg.seed),
     )
     
     print(termcolor.colored(trajs, "light_yellow"))
@@ -61,6 +78,5 @@ def eval(cfg):
     info["argv"] = sys.argv
     print(OmegaConf.to_yaml(info))
 
-    exit(0)
     env.close()
     simulation_app.close()

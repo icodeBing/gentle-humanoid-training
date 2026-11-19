@@ -82,7 +82,9 @@ class MotionTrackingCommand(Command):
                 feet_patterns: list[str] = ["left_ankle_roll_link", "right_ankle_roll_link"],
                 init_noise: dict[str, float] = {},
                 reward_sigma: dict[str, list[float]] = {},
-                student_train: bool = False,):
+                student_train: bool = False,
+                motion_buffer_steps: int = 1000,
+                motion_start_frame: int | None = None,):
         super().__init__(env)
         
         self.future_steps = torch.tensor([0, 2, 4, 8, 16], device=self.device)
@@ -95,8 +97,9 @@ class MotionTrackingCommand(Command):
         ]
 
         self.student_train = student_train
+        self.motion_start_frame = motion_start_frame
 
-        self.dataset = ProgressiveMultiMotionDataset(**dataset, env_size=self.num_envs, max_step_size=1000, dataset_extra_keys=dataset_extra_keys, device=self.device, ds_device=torch.device("cpu"), refresh_threshold=1000 * 20)
+        self.dataset = ProgressiveMultiMotionDataset(**dataset, env_size=self.num_envs, max_step_size=motion_buffer_steps, dataset_extra_keys=dataset_extra_keys, device=self.device, ds_device=torch.device("cpu"), refresh_threshold=1000 * 20)
         self.dataset.set_limit(self.asset.data.soft_joint_pos_limits, self.asset.data.soft_joint_vel_limits, self.asset.joint_names)
 
         # bodies for full‑body keypoint tracking
@@ -179,6 +182,10 @@ class MotionTrackingCommand(Command):
         rand_float = torch.rand(env_ids.shape[0], device=env_ids.device) * 0.75  # [0,0.75)
         offsets = (rand_float * max_start.to(torch.float32)).floor().int()
         t[:] = offsets * (torch.rand(env_ids.shape[0], device=env_ids.device) > self.zero_init_prob)
+        if self.motion_start_frame is not None:
+            if (lengths <= self.motion_start_frame).any():
+                raise ValueError("--motion-start lies beyond the selected motion length")
+            t.fill_(self.motion_start_frame)
 
         self.lengths[env_ids] = lengths
         self.t[env_ids] = t
@@ -548,6 +555,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         compliance: bool = True,
         net_force_limit: float = 30.0,
         net_torque_limit: float = 20.0,
+        eval_interaction: dict | None = None,
         **kwargs,
     ):
         super().__init__(env, *args, **kwargs)
@@ -669,6 +677,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.force_alpha = 1.0
 
         self.configure_admittance()
+        self.eval_interaction = None
+        if eval_interaction is not None:
+            from .evaluation_interaction import EvaluationInteraction
+            self.eval_interaction = EvaluationInteraction(self, eval_interaction)
 
     def configure_admittance(self):
         self.admit = AdmittanceMassChain(
@@ -703,6 +715,8 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.force_safe_limit_tl.reset(env_ids)
             self.force_safe_limit_tl.set(env_ids, start=self.force_safe_default, end=self.force_safe_default, total_steps=1)
             self.force_safe_limit_sample_timer[env_ids] = 0
+        if self.eval_interaction is not None:
+            self.eval_interaction.reset(env_ids)
     
     def force_schedule(self):
         # procedure:
@@ -828,13 +842,15 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
         self.force_origin_tl.set(env_ids=env_ids, start=pos_b_start, end=pos_b_end, total_steps=transit_steps)
 
-    def force_update_origin_and_target(self):
+    def force_update_origin_and_target(self, origin_w=None, direction_w=None):
         root_pos_w = self.asset.data.root_pos_w.unsqueeze(1)
         root_quat = self.asset.data.root_quat_w
         root_quat_exp = root_quat.unsqueeze(1)
 
         # spring origin is stored in the root frame
-        force_origin_b = self.force_origin_tl.current
+        force_origin_b = self.force_origin_tl.current if origin_w is None else quat_apply_inverse(
+            root_quat_exp, origin_w - root_pos_w
+        )
         self.force_origin_w[:] = quat_apply(root_quat_exp, force_origin_b) + root_pos_w
 
         # reference keypoints expressed directly in the robot root frame
@@ -847,6 +863,8 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.ref_pos_b_prev[:] = ref_point_b
 
         force_dir_b = normalize(ref_point_b - force_origin_b)
+        if direction_w is not None:
+            force_dir_b = quat_apply_inverse(root_quat_exp, direction_w)
 
         self.force_dir_w[:] = quat_apply(root_quat_exp, force_dir_b)
 
@@ -1033,6 +1051,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
     def before_update(self):
         super().before_update()
         self.update_reward_target()
+        if self.eval_interaction is not None:
+            self.eval_interaction.prepare_targets()
+            return
         if self.compliance:
             self.force_kp_tl.update_time()
             self.force_origin_tl.update_time()
@@ -1045,6 +1066,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     def step(self, substep: int):
         super().step(substep)
+        if self.eval_interaction is not None:
+            self.eval_interaction.apply(substep)
+            return
         if self.compliance:
             self.force_apply(substep)
         elif self.max_force > 0.0:

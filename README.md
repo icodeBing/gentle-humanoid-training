@@ -135,3 +135,14 @@ The quantity shown is `command_manager.force_applied_w` (`[num_envs, 6, 3]`, wor
 Newton): the virtual spring force applied to `shoulder_yaw`, `wrist_roll` and `hand_mimic`
 of both arms at every physics substep (see `MotionTrackingCommand_impedance.force_apply`).
 In a GUI run (`-p`) the same quantity is already drawn as blue arrows by `debug_draw`.
+In controlled payload experiments, the overlay and `force-*.csv` instead show the
+total external force including the independent payload; `bodies.csv` separates its components.
+
+### Controlled single-policy compliance experiments
+
+Use `--experiment spring --safe-force 5` to replay a fixed motion with a controlled
+virtual spring, or `--experiment load --load-kg 1.0 --safe-force 10` for a downward
+equivalent payload. Both support `--duration`, `--dataset`, `--motion-id`, force timing,
+video arrows, and separate force/position/torque logs. Use `--experiment none` for an
+unloaded reference. Full commands and interpretation are in
+[单策略上肢柔顺实验说明](docs/interaction_experiments_zh.md).

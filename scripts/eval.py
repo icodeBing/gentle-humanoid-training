@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from isaaclab.app import AppLauncher
 from scripts.utils.play import play
 from scripts.utils.eval import eval
+from scripts.utils.interaction_cli import add_interaction_arguments, configure_interaction
 
 FILE_PATH = os.path.dirname(__file__)
 
@@ -31,8 +32,11 @@ def main():
     parser.add_argument("--show-force", action="store_true", default=False,
                         help="Overlay the external force applied to the robot on the recorded video "
                              "and dump it to a csv (only used together with --video).")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Evaluation and recording duration in seconds; defaults to the task episode length.")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
+    add_interaction_arguments(parser)
     args = parser.parse_args()
 
     if args.checkpoint is not None:
@@ -115,7 +119,20 @@ def main():
         if args.command:
             cfg["task"]["command"] = _cfg.task.command
         cfg["task"]["flags"] = _cfg.task.flags
+
+    if args.duration is not None:
+        import math
+        if not math.isfinite(args.duration) or args.duration <= 0:
+            parser.error("--duration must be greater than zero")
+        step_dt = float(cfg.task.sim.step_dt)
+        cfg["task"]["max_episode_length"] = max(1, int(round(args.duration / step_dt)))
+        print(
+            f"[Info] Evaluation duration: {cfg['task']['max_episode_length'] * step_dt:.3f}s "
+            f"({cfg['task']['max_episode_length']} steps at {step_dt:.4f}s/step)."
+        )
     
+    configure_interaction(args, cfg, parser)
+
     if args.play:
         if not args.success:
             cfg["app"]["headless"] = False
