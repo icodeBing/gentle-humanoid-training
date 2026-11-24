@@ -9,6 +9,7 @@ viewer:
 robot: 
   name: g1
 terrain: plane
+flags: []
 
 # common
 num_envs: 16384

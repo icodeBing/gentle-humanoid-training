@@ -34,6 +34,8 @@ def main():
                              "and dump it to a csv (only used together with --video).")
     parser.add_argument("--duration", type=float, default=None,
                         help="Evaluation and recording duration in seconds; defaults to the task episode length.")
+    parser.add_argument("--num-envs", type=int, default=None,
+                        help="Override the number of parallel environments for evaluation or playback.")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     add_interaction_arguments(parser)
@@ -130,6 +132,12 @@ def main():
             f"[Info] Evaluation duration: {cfg['task']['max_episode_length'] * step_dt:.3f}s "
             f"({cfg['task']['max_episode_length']} steps at {step_dt:.4f}s/step)."
         )
+
+    if args.num_envs is not None:
+        if args.num_envs < 1:
+            parser.error("--num-envs must be at least 1")
+        cfg.task.num_envs = args.num_envs
+        print(f"[Info] Evaluation environments: {args.num_envs}")
     
     configure_interaction(args, cfg, parser)
 

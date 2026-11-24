@@ -242,6 +242,8 @@ def _force_snapshot(base_env, env_index: int | None = None):
     limit = float("nan")
     if hasattr(command, "force_safe_limit_tl"):
         limit = float(command.force_safe_limit_tl.current[env_index].reshape(-1)[0])
+    elif hasattr(command, "safe_force_limit"):
+        limit = float(command.safe_force_limit[env_index].reshape(-1)[0])
 
     indices = command.force_apply_idx_asset
     indices = indices.tolist() if hasattr(indices, "tolist") else list(indices)

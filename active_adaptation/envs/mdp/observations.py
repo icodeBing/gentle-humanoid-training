@@ -197,6 +197,36 @@ class root_linvel_b(Observation):
                 linvel,
                 color=(0.8, 0.1, 0.1, 1.)
             )
+
+
+class root_linvel_history(Observation):
+    """Short proprioceptive history of root linear velocity in body frame."""
+
+    def __init__(self, env, history_steps: list[int] = [0, 1, 2, 3, 4], noise_std: float = 0.0):
+        super().__init__(env)
+        self.asset: Articulation = self.env.scene["robot"]
+        self.history_steps = history_steps
+        self.noise_std = max(float(noise_std), 0.0)
+        self.buffer = torch.zeros(self.num_envs, max(history_steps) + 1, 3, device=self.device)
+        self.update()
+
+    def reset(self, env_ids):
+        value = self.asset.data.root_lin_vel_b[env_ids]
+        self.buffer[env_ids] = value.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
+
+    def update(self):
+        value = self.asset.data.root_lin_vel_b
+        if self.noise_std:
+            value = random_noise(value, self.noise_std)
+        self.buffer = self.buffer.roll(1, dims=1)
+        self.buffer[:, 0] = value
+
+    def compute(self):
+        return self.buffer[:, self.history_steps].reshape(self.num_envs, -1)
+
+    def symmetry_transforms(self):
+        transform = sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1., -1., 1.])
+        return transform.repeat(len(self.history_steps))
     
 class JointObs(Observation):
     def __init__(

@@ -66,7 +66,9 @@ class SimpleEnv(_Env):
 
 
             ### add task related objects
-            flags = self.cfg.flags or []
+            # Flags are optional task-specific scene features.  Keep the
+            # environment usable for base task configs that do not declare any.
+            flags = self.cfg.get("flags", []) or []
 
             sim_cfg = sim_utils.SimulationCfg(
                 dt=self.cfg.sim.isaac_physics_dt,
