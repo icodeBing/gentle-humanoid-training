@@ -55,10 +55,19 @@ def main():
     parser.add_argument("--settle-spring-direction", nargs=3, type=float, default=None,
                         metavar=("DX", "DY", "DZ"),
                         help="Fixed spring direction in nominal body coordinates.")
+    parser.add_argument("--settle-force-bodies", nargs="+", default=None,
+                        choices=[
+                            "left_shoulder_yaw_link", "right_shoulder_yaw_link",
+                            "left_wrist_roll_link", "right_wrist_roll_link",
+                            "left_hand_mimic", "right_hand_mimic",
+                        ],
+                        help="Interaction bodies that receive the replay spring; default: all six.")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     add_interaction_arguments(parser)
     args = parser.parse_args()
+    if args.settle_force_bodies is not None and args.settle_force_mode is None:
+        parser.error("--settle-force-bodies requires --settle-force-mode")
 
     if args.checkpoint is not None:
         checkpoint_path = os.path.abspath(args.checkpoint)
@@ -190,6 +199,7 @@ def main():
             max_force=args.settle_max_force,
             direction=args.settle_spring_direction,
             safe_force=args.settle_safe_force,
+            body_names=args.settle_force_bodies,
         )
     
     configure_interaction(args, cfg, parser)

@@ -124,6 +124,9 @@ class StandingImpedanceCommand(Command):
         self.eval_max_force = None
         self.eval_safe_force = None
         self.eval_direction_b = None
+        self.eval_force_body_mask = torch.ones(
+            self.num_force_bodies, dtype=torch.bool, device=self.device
+        )
 
         self.admit = AdmittanceMassChain(
             num_envs=self.num_envs,
@@ -159,8 +162,11 @@ class StandingImpedanceCommand(Command):
             self.force_kp[env_ids] = torch.empty(n, self.num_force_bodies, 1, device=self.device).uniform_(*self.hand_stiffness_range)
         else:
             self.force_kp[env_ids] = self.eval_spring_k
+        # Mask stiffness at reset as well, before the first physics step.
+        self.force_kp[env_ids] *= self.eval_force_body_mask.reshape(1, -1, 1)
         self.force_kp_nominal[env_ids] = self.force_kp[env_ids]
         active = torch.rand(n, self.num_force_bodies, 1, device=self.device) > 0.25
+        active &= self.eval_force_body_mask.reshape(1, -1, 1)
         idle = torch.rand(n, 1, 1, device=self.device) < 0.25
         active &= ~idle
         self.force_enable[env_ids] = active
@@ -233,6 +239,7 @@ class StandingImpedanceCommand(Command):
         max_force: float | None = None,
         direction: list[float] | tuple[float, float, float] | None = None,
         safe_force: float | None = None,
+        body_names: list[str] | tuple[str, ...] | None = None,
     ):
         """Override spring parameters for deterministic replay only."""
         if stiffness is not None and stiffness < 0.0:
@@ -252,6 +259,22 @@ class StandingImpedanceCommand(Command):
         self.eval_spring_offset = None if offset is None else float(offset)
         self.eval_max_force = None if max_force is None else float(max_force)
         self.eval_safe_force = None if safe_force is None else float(safe_force)
+        self.eval_force_body_mask[:] = False
+        if body_names is None:
+            self.eval_force_body_mask[:] = True
+        else:
+            requested = set(body_names)
+            available = {
+                self.asset.body_names[i] for i in self.force_apply_idx_asset.tolist()
+            }
+            unknown = requested - available
+            if unknown or not requested:
+                raise ValueError(
+                    f"Unknown evaluation force bodies: {sorted(unknown)}; "
+                    f"select at least one of: {sorted(available)}"
+                )
+            for force_i, asset_i in enumerate(self.force_apply_idx_asset.tolist()):
+                self.eval_force_body_mask[force_i] = self.asset.body_names[asset_i] in requested
 
     def _update_eval_schedule(self):
         schedule = self.eval_force_schedule
@@ -279,6 +302,7 @@ class StandingImpedanceCommand(Command):
 
         self.force_scale[:] = scale
         self.force_enable[:] = scale.unsqueeze(1) > 0.0
+        self.force_enable[:] &= self.eval_force_body_mask.reshape(1, -1, 1)
         self.force_kp = self.force_kp_nominal * self.force_enable * scale.unsqueeze(1)
         self.eval_force_step += 1
 
