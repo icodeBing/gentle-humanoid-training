@@ -43,6 +43,13 @@ def eval(cfg):
         torch.manual_seed(cfg.seed)
 
     env, agent, vecnorm, _ = make_env_policy(cfg)
+    schedule = cfg.get("eval_settle_force_schedule")
+    if schedule is not None:
+        command = env.base_env.command_manager
+        if not hasattr(command, "set_eval_force_schedule"):
+            raise RuntimeError("The loaded command does not support settle force replay schedules")
+        command.set_eval_force_schedule(**dict(schedule))
+        print(f"[Replay] settle force schedule: {dict(schedule)}")
     
     keys = [
         ("next", "stats"),

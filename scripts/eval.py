@@ -36,6 +36,14 @@ def main():
                         help="Evaluation and recording duration in seconds; defaults to the task episode length.")
     parser.add_argument("--num-envs", type=int, default=None,
                         help="Override the number of parallel environments for evaluation or playback.")
+    parser.add_argument("--settle-force-mode", choices=["random", "off", "on", "pulse"], default=None,
+                        help="Deterministic force schedule for StandingImpedance replay.")
+    parser.add_argument("--settle-force-start", type=float, default=0.0,
+                        help="Force onset time in seconds for --settle-force-mode pulse.")
+    parser.add_argument("--settle-force-end", type=float, default=None,
+                        help="Force release time in seconds for --settle-force-mode pulse.")
+    parser.add_argument("--settle-force-ramp", type=float, default=0.0,
+                        help="Force ramp time in seconds for --settle-force-mode pulse.")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     add_interaction_arguments(parser)
@@ -138,6 +146,23 @@ def main():
             parser.error("--num-envs must be at least 1")
         cfg.task.num_envs = args.num_envs
         print(f"[Info] Evaluation environments: {args.num_envs}")
+
+    if args.settle_force_mode is not None:
+        if args.settle_force_mode == "pulse" and args.settle_force_end is None:
+            parser.error("--settle-force-mode pulse requires --settle-force-end")
+        if args.settle_force_start < 0 or args.settle_force_ramp < 0:
+            parser.error("settle force times must be non-negative")
+        if args.settle_force_end is not None and args.settle_force_end <= args.settle_force_start:
+            parser.error("--settle-force-end must be greater than --settle-force-start")
+        target = str(cfg.task.command.get("_target_", ""))
+        if not target.endswith("StandingImpedanceCommand"):
+            parser.error("--settle-force-mode requires a G1SETTLE/StandingImpedance checkpoint")
+        cfg.eval_settle_force_schedule = dict(
+            mode=args.settle_force_mode,
+            start_s=args.settle_force_start,
+            end_s=args.settle_force_end,
+            ramp_s=args.settle_force_ramp,
+        )
     
     configure_interaction(args, cfg, parser)
 

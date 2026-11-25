@@ -116,6 +116,9 @@ class StandingImpedanceCommand(Command):
         self.joint_pos_boot_protect = self.init_joint_pos.clone()
         self._cum_error = torch.zeros(self.num_envs, 3, device=self.device)
         self.skip_ref = True
+        # Optional deterministic schedule used only by evaluation replay.
+        self.eval_force_schedule = None
+        self.eval_force_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         self.admit = AdmittanceMassChain(
             num_envs=self.num_envs,
@@ -186,6 +189,57 @@ class StandingImpedanceCommand(Command):
     def reset(self, env_ids: torch.Tensor):
         self._cum_error[env_ids] = 0.0
 
+    def set_eval_force_schedule(
+        self,
+        mode: str,
+        start_s: float = 0.0,
+        end_s: float | None = None,
+        ramp_s: float = 0.0,
+    ):
+        """Set a deterministic force schedule for replay without changing training."""
+        if mode not in {"random", "off", "on", "pulse"}:
+            raise ValueError(f"Unknown evaluation force mode: {mode}")
+        if start_s < 0.0 or ramp_s < 0.0:
+            raise ValueError("Evaluation force times must be non-negative")
+        if end_s is not None and end_s <= start_s:
+            raise ValueError("Evaluation force end must be greater than start")
+        self.eval_force_schedule = {
+            "mode": mode,
+            "start_s": float(start_s),
+            "end_s": None if end_s is None else float(end_s),
+            "ramp_s": float(ramp_s),
+        }
+        self.eval_force_step.zero_()
+
+    def _update_eval_schedule(self):
+        schedule = self.eval_force_schedule
+        if schedule is None or schedule["mode"] == "random":
+            self._update_schedule()
+            return
+
+        time_s = self.eval_force_step.float().unsqueeze(-1) * self.env.step_dt
+        mode = schedule["mode"]
+        if mode == "off":
+            scale = torch.zeros_like(time_s)
+        elif mode == "on":
+            scale = torch.ones_like(time_s)
+        else:
+            end_s = schedule["end_s"]
+            if end_s is None:
+                raise ValueError("Pulse evaluation schedule requires end_s")
+            active = (time_s >= schedule["start_s"]) & (time_s < end_s)
+            scale = active.float()
+            ramp_s = schedule["ramp_s"]
+            if ramp_s > 0.0:
+                ramp_in = ((time_s - schedule["start_s"]) / ramp_s).clamp(0.0, 1.0)
+                ramp_out = ((end_s - time_s) / ramp_s).clamp(0.0, 1.0)
+                scale = scale * torch.minimum(ramp_in, ramp_out)
+
+        self.force_scale[:] = scale
+        self.force_enable[:] = scale.unsqueeze(1) > 0.0
+        self.force_kp = self.force_kp_nominal * self.force_enable * scale.unsqueeze(1)
+        self.eval_force_step += 1
+
     def _update_schedule(self):
         self.force_timer -= 1
         active = self.force_enable.any(dim=(1, 2))
@@ -227,7 +281,7 @@ class StandingImpedanceCommand(Command):
             self.force_enable.zero_()
             self.force_kp.zero_()
         else:
-            self._update_schedule()
+            self._update_eval_schedule()
 
         root_pos = self.asset.data.root_pos_w.unsqueeze(1)
         root_quat = self.asset.data.root_quat_w.unsqueeze(1)
