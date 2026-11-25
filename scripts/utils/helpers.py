@@ -201,7 +201,7 @@ from tqdm import tqdm
 # ([num_envs, num_force_bodies, 3], world frame, Newton).
 #
 # The helpers below make that quantity visible in a headless `--video` replay:
-#   * a HUD with per-body force components / magnitude / expected value,
+#   * projected per-body force arrows, a HUD with force components / magnitude,
 #   * a rolling |F| curve per body at the bottom of the frame,
 #   * a csv next to the video for offline plotting.
 # --------------------------------------------------------------------------------------
@@ -248,9 +248,11 @@ def _force_snapshot(base_env, env_index: int | None = None):
     indices = command.force_apply_idx_asset
     indices = indices.tolist() if hasattr(indices, "tolist") else list(indices)
     names = [str(command.asset.body_names[i]).replace("_link", "") for i in indices]
+    positions = command.asset.data.body_pos_w[env_index, indices].detach().float().cpu().numpy()
 
     return {
         "applied": applied,                                                  # [M, 3]
+        "positions": positions,                                              # [M, 3], world frame
         "expected": expected,                                                # [M, 3] | None
         "magnitudes": np.linalg.norm(applied, axis=-1),                      # [M]
         "limit": limit,                                                      # scalar
@@ -260,6 +262,7 @@ def _force_snapshot(base_env, env_index: int | None = None):
 
 def _draw_force_chart(frame: np.ndarray, history, height: int = 170, pad: int = 12):
     """Rolling |F| curve per force body, drawn at the bottom of the frame."""
+    frame = np.array(frame, copy=True)
     mag = np.stack(history["mag"], axis=0)                                   # [T, M]
     if mag.shape[0] < 2:
         return frame, max(1.0, float(mag.max()))
@@ -303,6 +306,63 @@ def _draw_force_chart(frame: np.ndarray, history, height: int = 170, pad: int = 
     return frame, ymax
 
 
+def _draw_force_arrows(frame: np.ndarray, snap):
+    """Project applied world-frame forces at their body locations into RGB."""
+    try:
+        from PIL import Image, ImageDraw
+        from pxr import UsdGeom
+        import omni.usd
+    except ImportError:
+        return frame
+
+    camera = UsdGeom.Camera(omni.usd.get_context().get_stage().GetPrimAtPath("/OmniverseKit_Persp"))
+    frustum = camera.GetCamera().frustum
+    view = frustum.ComputeViewMatrix()
+    matrix = view * frustum.ComputeProjectionMatrix()
+    h, w = frame.shape[:2]
+
+    def project(point):
+        from pxr import Gf
+        p = Gf.Vec3d(*(float(v) for v in point))
+        if view.Transform(p)[2] >= 0:
+            return None
+        ndc = matrix.Transform(p)
+        if not all(np.isfinite(v) for v in ndc) or max(abs(ndc[0]), abs(ndc[1])) > 3:
+            return None
+        return np.array(((ndc[0] + 1) * w / 2, (1 - ndc[1]) * h / 2), dtype=np.float32)
+
+    image = Image.fromarray(frame)
+    draw = ImageDraw.Draw(image)
+    for m, (origin, force) in enumerate(zip(snap["positions"], snap["applied"])):
+        magnitude = float(np.linalg.norm(force))
+        if magnitude < 0.1:
+            continue
+        direction = force / magnitude
+        # Keep arrows legible across the configured force range without letting
+        # a saturated spring obscure the robot.
+        arrow_length_m = min(0.012 * magnitude, 0.40)
+        start = project(origin)
+        end = project(origin + direction * arrow_length_m)
+        if start is None or end is None:
+            continue
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length < 3.0:
+            continue
+        color = _FORCE_COLORS[m % len(_FORCE_COLORS)]
+        unit = delta / length
+        head_length = min(11.0, max(6.0, length * 0.22))
+        normal = np.array((-unit[1], unit[0]), dtype=np.float32)
+        base = end - unit * head_length
+        left = base + normal * head_length * 0.55
+        right = base - normal * head_length * 0.55
+        p0, p1, p2 = [tuple(np.round(p).astype(int)) for p in (end, left, right)]
+        draw.line([tuple(np.round(start).astype(int)), tuple(np.round(base).astype(int))], fill=color, width=4)
+        draw.polygon([p0, p1, p2], fill=color)
+
+    return np.array(image, copy=True)
+
+
 def _overlay_force_text(frame: np.ndarray, snap, step: int, time_s: float, ymax: float):
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -323,6 +383,7 @@ def _overlay_force_text(frame: np.ndarray, snap, step: int, time_s: float, ymax:
             text += f"  |Fexp|={float(np.linalg.norm(snap['expected'][m])):6.2f}N"
         add(text, _FORCE_COLORS[m % len(_FORCE_COLORS)])
     add(f"policy safety input = {snap['limit']:5.2f}N (not a hard force clamp)", (200, 200, 200))
+    add("arrows: applied-force direction; length = 0.012 m/N (capped at 0.40 m)", (220, 220, 220))
 
     image = Image.fromarray(frame)
     draw = ImageDraw.Draw(image, "RGBA")
@@ -345,11 +406,12 @@ def _overlay_force_text(frame: np.ndarray, snap, step: int, time_s: float, ymax:
         draw.text((14, y), line, font=font, fill=color + (255,))
         y += line_height
 
-    return np.array(image)
+    return np.array(image, copy=True)
 
 
 def _overlay_force(frame: np.ndarray, snap, step: int, time_s: float, history):
     frame = np.array(frame, copy=True)
+    frame = _draw_force_arrows(frame, snap)
     frame, ymax = _draw_force_chart(frame, history)
     return _overlay_force_text(frame, snap, step, time_s, ymax)
 

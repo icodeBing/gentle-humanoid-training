@@ -50,6 +50,13 @@ def eval(cfg):
             raise RuntimeError("The loaded command does not support settle force replay schedules")
         command.set_eval_force_schedule(**dict(schedule))
         print(f"[Replay] settle force schedule: {dict(schedule)}")
+    spring = cfg.get("eval_settle_spring")
+    if spring is not None:
+        command = env.base_env.command_manager
+        if not hasattr(command, "set_eval_spring"):
+            raise RuntimeError("The loaded command does not support settle spring replay overrides")
+        command.set_eval_spring(**dict(spring))
+        print(f"[Replay] settle spring override: {dict(spring)}")
     
     keys = [
         ("next", "stats"),

@@ -119,6 +119,11 @@ class StandingImpedanceCommand(Command):
         # Optional deterministic schedule used only by evaluation replay.
         self.eval_force_schedule = None
         self.eval_force_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.eval_spring_k = None
+        self.eval_spring_offset = None
+        self.eval_max_force = None
+        self.eval_safe_force = None
+        self.eval_direction_b = None
 
         self.admit = AdmittanceMassChain(
             num_envs=self.num_envs,
@@ -140,13 +145,20 @@ class StandingImpedanceCommand(Command):
 
     def _sample_force(self, env_ids: torch.Tensor):
         n = env_ids.numel()
-        direction = torch.randn(n, 1, 3, device=self.device)
-        direction[..., 2] *= 0.35
-        direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        if self.eval_direction_b is None:
+            direction = torch.randn(n, 1, 3, device=self.device)
+            direction[..., 2] *= 0.35
+            direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        else:
+            direction = self.eval_direction_b.reshape(1, 1, 3).expand(n, 1, 3)
         direction = direction.expand(-1, self.num_force_bodies, -1)
         self.force_dir_b[env_ids] = direction
-        self.force_origin_b[env_ids] = self.nominal_hand_b[env_ids] + direction * self.hand_offset
-        self.force_kp[env_ids] = torch.empty(n, self.num_force_bodies, 1, device=self.device).uniform_(*self.hand_stiffness_range)
+        offset = self.hand_offset if self.eval_spring_offset is None else self.eval_spring_offset
+        self.force_origin_b[env_ids] = self.nominal_hand_b[env_ids] + direction * offset
+        if self.eval_spring_k is None:
+            self.force_kp[env_ids] = torch.empty(n, self.num_force_bodies, 1, device=self.device).uniform_(*self.hand_stiffness_range)
+        else:
+            self.force_kp[env_ids] = self.eval_spring_k
         self.force_kp_nominal[env_ids] = self.force_kp[env_ids]
         active = torch.rand(n, self.num_force_bodies, 1, device=self.device) > 0.25
         idle = torch.rand(n, 1, 1, device=self.device) < 0.25
@@ -157,7 +169,10 @@ class StandingImpedanceCommand(Command):
             device=self.device, dtype=self.force_timer.dtype,
         )
         self.force_scale[env_ids] = 1.0
-        self.safe_force_limit[env_ids] = torch.empty(n, 1, device=self.device).uniform_(*self.safe_force_range)
+        if self.eval_safe_force is None:
+            self.safe_force_limit[env_ids] = torch.empty(n, 1, device=self.device).uniform_(*self.safe_force_range)
+        else:
+            self.safe_force_limit[env_ids] = self.eval_safe_force
 
     def sample_init(self, env_ids: torch.Tensor):
         root_state = self.init_root_state[env_ids].clone()
@@ -197,7 +212,7 @@ class StandingImpedanceCommand(Command):
         ramp_s: float = 0.0,
     ):
         """Set a deterministic force schedule for replay without changing training."""
-        if mode not in {"random", "off", "on", "pulse"}:
+        if mode not in {"random", "off", "spring", "on", "pulse"}:
             raise ValueError(f"Unknown evaluation force mode: {mode}")
         if start_s < 0.0 or ramp_s < 0.0:
             raise ValueError("Evaluation force times must be non-negative")
@@ -211,6 +226,33 @@ class StandingImpedanceCommand(Command):
         }
         self.eval_force_step.zero_()
 
+    def set_eval_spring(
+        self,
+        stiffness: float | None = None,
+        offset: float | None = None,
+        max_force: float | None = None,
+        direction: list[float] | tuple[float, float, float] | None = None,
+        safe_force: float | None = None,
+    ):
+        """Override spring parameters for deterministic replay only."""
+        if stiffness is not None and stiffness < 0.0:
+            raise ValueError("Evaluation spring stiffness must be non-negative")
+        if offset is not None and offset < 0.0:
+            raise ValueError("Evaluation spring offset must be non-negative")
+        if max_force is not None and max_force <= 0.0:
+            raise ValueError("Evaluation max force must be positive")
+        if safe_force is not None and not 5.0 <= safe_force <= 15.0:
+            raise ValueError("Evaluation safe force must be between 5 and 15 N")
+        if direction is not None:
+            direction_t = torch.as_tensor(direction, dtype=torch.float32, device=self.device)
+            if direction_t.numel() != 3 or direction_t.norm() < 1e-6:
+                raise ValueError("Evaluation spring direction must be a nonzero 3-vector")
+            self.eval_direction_b = direction_t / direction_t.norm()
+        self.eval_spring_k = None if stiffness is None else float(stiffness)
+        self.eval_spring_offset = None if offset is None else float(offset)
+        self.eval_max_force = None if max_force is None else float(max_force)
+        self.eval_safe_force = None if safe_force is None else float(safe_force)
+
     def _update_eval_schedule(self):
         schedule = self.eval_force_schedule
         if schedule is None or schedule["mode"] == "random":
@@ -221,7 +263,7 @@ class StandingImpedanceCommand(Command):
         mode = schedule["mode"]
         if mode == "off":
             scale = torch.zeros_like(time_s)
-        elif mode == "on":
+        elif mode in {"spring", "on"}:
             scale = torch.ones_like(time_s)
         else:
             end_s = schedule["end_s"]
@@ -274,7 +316,8 @@ class StandingImpedanceCommand(Command):
             current = self._current_hand_b().detach()
             self.nominal_hand_b[ids] = current[ids]
             self.nominal_initialized[ids] = True
-            self.force_origin_b[ids] = self.nominal_hand_b[ids] + self.force_dir_b[ids] * self.hand_offset
+            offset = self.hand_offset if self.eval_spring_offset is None else self.eval_spring_offset
+            self.force_origin_b[ids] = self.nominal_hand_b[ids] + self.force_dir_b[ids] * offset
             self.admit.reset(ids, self.nominal_hand_b[ids], torch.zeros_like(self.nominal_hand_b[ids]))
 
         if not self.compliance:
@@ -294,7 +337,8 @@ class StandingImpedanceCommand(Command):
             drive = clamp_norm(drive, force_limit)
             delta = self.force_origin_b - self.admit.x[0]
             ext = self.force_kp * delta
-            ext = clamp_norm(ext, self.max_force)
+            max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
+            ext = clamp_norm(ext, max_force)
             self.admit.step(drive, ext)
 
         self.force_keypoint_b[:] = self.admit.x[0]
@@ -304,7 +348,8 @@ class StandingImpedanceCommand(Command):
             self.force_keypoint_w_prev[new_ids] = self.force_keypoint_w[new_ids]
             self.force_keypoint_vel_w[new_ids] = 0.0
         self.force_keypoint_w_prev[:] = self.force_keypoint_w
-        expected_b = clamp_norm(self.force_kp * (self.force_origin_b - self.force_keypoint_b), self.max_force)
+        max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
+        expected_b = clamp_norm(self.force_kp * (self.force_origin_b - self.force_keypoint_b), max_force)
         self.force_expected_b[:] = expected_b
         self.force_expected_w[:] = quat_apply(root_quat, expected_b)
 
@@ -334,7 +379,8 @@ class StandingImpedanceCommand(Command):
         hand_pos = self.asset.data.body_pos_w[:, self.force_apply_idx_asset]
         hand_delta = self.force_origin_b
         current_b = quat_apply_inverse(root_quat, hand_pos - self.asset.data.root_pos_w.unsqueeze(1))
-        force_b = clamp_norm(self.force_kp * (hand_delta - current_b), self.max_force)
+        max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
+        force_b = clamp_norm(self.force_kp * (hand_delta - current_b), max_force)
         self.force_applied_w[:] = quat_apply(root_quat, force_b)
         self.force_applied_b[:] = force_b
         self.force_apply_buffer[:, self.force_apply_idx_asset] = self.force_applied_w

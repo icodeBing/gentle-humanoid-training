@@ -36,7 +36,7 @@ def main():
                         help="Evaluation and recording duration in seconds; defaults to the task episode length.")
     parser.add_argument("--num-envs", type=int, default=None,
                         help="Override the number of parallel environments for evaluation or playback.")
-    parser.add_argument("--settle-force-mode", choices=["random", "off", "on", "pulse"], default=None,
+    parser.add_argument("--settle-force-mode", choices=["random", "off", "spring", "on", "pulse"], default=None,
                         help="Deterministic force schedule for StandingImpedance replay.")
     parser.add_argument("--settle-force-start", type=float, default=0.0,
                         help="Force onset time in seconds for --settle-force-mode pulse.")
@@ -44,6 +44,17 @@ def main():
                         help="Force release time in seconds for --settle-force-mode pulse.")
     parser.add_argument("--settle-force-ramp", type=float, default=0.0,
                         help="Force ramp time in seconds for --settle-force-mode pulse.")
+    parser.add_argument("--settle-spring-k", type=float, default=None,
+                        help="Fixed replay spring stiffness in N/m; otherwise use the task sampler.")
+    parser.add_argument("--settle-spring-offset", type=float, default=None,
+                        help="Fixed replay anchor offset in meters; otherwise use the task value.")
+    parser.add_argument("--settle-max-force", type=float, default=None,
+                        help="Per-interaction-body spring force cap in N; task default is 60 N.")
+    parser.add_argument("--settle-safe-force", type=float, default=None,
+                        help="Policy safety input for replay, 5..15 N; not a hard force clamp.")
+    parser.add_argument("--settle-spring-direction", nargs=3, type=float, default=None,
+                        metavar=("DX", "DY", "DZ"),
+                        help="Fixed spring direction in nominal body coordinates.")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     add_interaction_arguments(parser)
@@ -162,6 +173,23 @@ def main():
             start_s=args.settle_force_start,
             end_s=args.settle_force_end,
             ramp_s=args.settle_force_ramp,
+        )
+        if args.settle_spring_k is not None and args.settle_spring_k < 0:
+            parser.error("--settle-spring-k must be non-negative")
+        if args.settle_spring_offset is not None and args.settle_spring_offset < 0:
+            parser.error("--settle-spring-offset must be non-negative")
+        if args.settle_max_force is not None and args.settle_max_force <= 0:
+            parser.error("--settle-max-force must be positive")
+        if args.settle_safe_force is not None and not 5 <= args.settle_safe_force <= 15:
+            parser.error("--settle-safe-force must be between 5 and 15 N")
+        if args.settle_spring_direction is not None and sum(v * v for v in args.settle_spring_direction) == 0:
+            parser.error("--settle-spring-direction must be nonzero")
+        cfg.eval_settle_spring = dict(
+            stiffness=args.settle_spring_k,
+            offset=args.settle_spring_offset,
+            max_force=args.settle_max_force,
+            direction=args.settle_spring_direction,
+            safe_force=args.settle_safe_force,
         )
     
     configure_interaction(args, cfg, parser)
