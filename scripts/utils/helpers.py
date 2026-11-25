@@ -250,7 +250,7 @@ def _force_snapshot(base_env, env_index: int | None = None):
     names = [str(command.asset.body_names[i]).replace("_link", "") for i in indices]
     positions = command.asset.data.body_pos_w[env_index, indices].detach().float().cpu().numpy()
 
-    return {
+    snap = {
         "applied": applied,                                                  # [M, 3]
         "positions": positions,                                              # [M, 3], world frame
         "expected": expected,                                                # [M, 3] | None
@@ -258,6 +258,10 @@ def _force_snapshot(base_env, env_index: int | None = None):
         "limit": limit,                                                      # scalar
         "names": names,
     }
+    if getattr(command, "eval_force_schedule", None) is not None:
+        snap["root_velocity"] = command.asset.data.root_lin_vel_w[env_index].detach().float().cpu().numpy()
+        snap["root_velocity_ref"] = command.root_vel_ref_w[env_index].detach().float().cpu().numpy()
+    return snap
 
 
 def _draw_force_chart(frame: np.ndarray, history, height: int = 170, pad: int = 12):
@@ -383,6 +387,11 @@ def _overlay_force_text(frame: np.ndarray, snap, step: int, time_s: float, ymax:
             text += f"  |Fexp|={float(np.linalg.norm(snap['expected'][m])):6.2f}N"
         add(text, _FORCE_COLORS[m % len(_FORCE_COLORS)])
     add(f"policy safety input = {snap['limit']:5.2f}N (not a hard force clamp)", (200, 200, 200))
+    if "root_velocity" in snap:
+        actual = snap["root_velocity"]
+        target = snap["root_velocity_ref"]
+        add(f"root velocity WORLD xy: actual=({actual[0]:+.3f},{actual[1]:+.3f})  "
+            f"reference=({target[0]:+.3f},{target[1]:+.3f}) m/s")
     add("arrows: applied-force direction; length = 0.012 m/N (capped at 0.40 m)", (220, 220, 220))
 
     image = Image.fromarray(frame)
@@ -453,6 +462,17 @@ def evaluate(
     tensordict_ = env.reset()
     command = env.base_env.command_manager
     interaction = getattr(command, "eval_interaction", None)
+    settle_replay = getattr(command, "eval_force_schedule", None) is not None
+    single_episode = interaction is not None or settle_replay
+    if settle_replay:
+        # Training reset randomizes episode ages and leaves the command awaiting
+        # its first update. Replay needs a full episode and initialized springs
+        # before the first physics step (including when the schedule is off).
+        env.base_env.episode_length_buf.zero_()
+        command.eval_force_step.zero_()
+        command.before_update()
+        command.update()
+        print("[Replay] Starting at episode step zero; recording stops at the first episode end.")
     recorder = None
     if interaction is not None:
         from scripts.utils.interaction_metrics import InteractionRecorder
@@ -470,6 +490,7 @@ def evaluate(
     frames = []
 
     force_records = []
+    motion_records = []
     force_history = {"mag": [], "limit": []}
     force_max_history = 400
 
@@ -481,14 +502,34 @@ def evaluate(
             tensordict_ = policy(tensordict_)
             e = time.perf_counter()
             inference_time.append(e - s)
-            if recorder is None:
+            if not single_episode:
                 tensordict, tensordict_ = env.step_and_maybe_reset(tensordict_)
             else:
                 from torchrl.envs.utils import step_mdp
                 tensordict = env.step(tensordict_)
                 tensordict_ = step_mdp(tensordict, keep_other=True)
-                recorder.capture(i, bool(tensordict["next", "terminated"].any()),
-                                 bool(tensordict["next", "truncated"].any()))
+                if recorder is not None:
+                    recorder.capture(i, bool(tensordict["next", "terminated"].any()),
+                                     bool(tensordict["next", "truncated"].any()))
+            if settle_replay:
+                index = int(getattr(env.base_env, "lookat_env_i", 0))
+                data = command.asset.data
+                row = dict(step=i, time_s=round((i + 1) * env.step_dt, 4),
+                           terminated=int(tensordict["next", "terminated"][index].any()),
+                           truncated=int(tensordict["next", "truncated"][index].any()))
+                for label, tensor, unit in [
+                    ("root_pos", data.root_pos_w, "m"),
+                    ("root_vel", data.root_lin_vel_w, "m_s"),
+                    ("root_vel_ref", command.root_vel_ref_w, "m_s"),
+                    ("root_ang_vel", data.root_ang_vel_w, "rad_s"),
+                ]:
+                    values = tensor[index].detach().float().cpu().tolist()
+                    row.update({f"{label}_{axis}_{unit}": float(value)
+                                for axis, value in zip("xyz", values)})
+                q = data.root_quat_w[index].detach().float().cpu().numpy()
+                row["root_yaw_rad"] = float(np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
+                                                        1 - 2 * (q[2] ** 2 + q[3] ** 2)))
+                motion_records.append(row)
             trajs.append(tensordict.select(*keys, strict=False).cpu())
             if render:
                 frame = env.render("rgb_array")
@@ -514,7 +555,11 @@ def evaluate(
                 if recorder is not None:
                     frame = recorder.overlay(frame)
                 frames.append(frame)
-            if recorder is not None and tensordict["next", "done"].any():
+            if single_episode and tensordict["next", "done"].any():
+                if settle_replay:
+                    print(f"[Replay] Stopped at {(i + 1) * env.step_dt:.2f}s: "
+                          f"terminated={bool(tensordict['next', 'terminated'].any())}, "
+                          f"truncated={bool(tensordict['next', 'truncated'].any())}")
                 break
     if recorder is not None:
         recorder.save()
@@ -564,6 +609,15 @@ def evaluate(
         peak = max(row[6] for row in force_records)
         info["force/peak"] = peak
         print(f"force log saved to {os.path.abspath(csv_path)} (peak |F| = {peak:.2f} N)")
+
+    if motion_records:
+        os.makedirs(video_dir, exist_ok=True)
+        motion_path = os.path.join(video_dir, f"motion-{time_str}.csv")
+        with open(motion_path, "w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(motion_records[0]))
+            writer.writeheader()
+            writer.writerows(motion_records)
+        print(f"root motion log saved to {os.path.abspath(motion_path)}")
 
     info["episode_cnt"] = episode_cnt
     return dict(sorted(info.items())), trajs, stats
