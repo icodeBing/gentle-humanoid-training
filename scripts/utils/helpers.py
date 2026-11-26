@@ -216,7 +216,25 @@ _FORCE_COLORS = [
 ]
 
 
-def _force_snapshot(base_env, env_index: int | None = None):
+def _force_reference_snapshot(base_env, env_index: int | None = None):
+    """Copy the prepared reference BEFORE physics can advance its schedule."""
+    command = base_env.command_manager
+    if env_index is None:
+        env_index = int(getattr(base_env, "lookat_env_i", 0))
+    result = {}
+    for key, attr in [("expected", "force_expected_w"), ("interact", "force_interact_w")]:
+        value = getattr(command, attr, None)
+        result[key] = None if value is None else value[env_index].detach().float().cpu().numpy().copy()
+    if hasattr(command, "force_safe_limit_tl"):
+        result["limit"] = float(command.force_safe_limit_tl.current[env_index].reshape(-1)[0])
+    elif hasattr(command, "safe_force_limit"):
+        result["limit"] = float(command.safe_force_limit[env_index].reshape(-1)[0])
+    else:
+        result["limit"] = float("nan")
+    return result
+
+
+def _force_snapshot(base_env, env_index: int | None = None, reference=None):
     """Read the force the environment currently applies to the robot.
 
     Returns ``None`` when the task does not apply external forces (e.g. locomotion).
@@ -245,6 +263,15 @@ def _force_snapshot(base_env, env_index: int | None = None):
     elif hasattr(command, "safe_force_limit"):
         limit = float(command.safe_force_limit[env_index].reshape(-1)[0])
 
+    # Standing before_update prepares the NEXT interval after physics. Pair the
+    # force just applied with the saved reference from ITS interval, particularly
+    # at load onset/release. Do not pair it with the next interval's reference.
+    interact = None
+    if reference is not None:
+        expected = reference["expected"]
+        interact = reference["interact"]
+        limit = reference["limit"]
+
     indices = command.force_apply_idx_asset
     indices = indices.tolist() if hasattr(indices, "tolist") else list(indices)
     names = [str(command.asset.body_names[i]).replace("_link", "") for i in indices]
@@ -254,6 +281,7 @@ def _force_snapshot(base_env, env_index: int | None = None):
         "applied": applied,                                                  # [M, 3]
         "positions": positions,                                              # [M, 3], world frame
         "expected": expected,                                                # [M, 3] | None
+        "interact": interact,                                                # last virtual substep, world frame
         "magnitudes": np.linalg.norm(applied, axis=-1),                      # [M]
         "limit": limit,                                                      # scalar
         "names": names,
@@ -425,13 +453,45 @@ def _overlay_force(frame: np.ndarray, snap, step: int, time_s: float, history):
     return _overlay_force_text(frame, snap, step, time_s, ymax)
 
 
+def _force_record_rows(snap, step: int, step_dt: float, physics_dt: float):
+    """Log world vectors; reference timestamps denote virtual integration time.
+
+    Applied force is from the final physics substep, interact is the input to
+    the final virtual substep, expected is evaluated at its final state. These
+    are paired within one control interval, not claimed to be sensor samples
+    from an identical physical instant. Standing uses four virtual substeps.
+    """
+    interval_start = step * step_dt
+    interval_end = (step + 1) * step_dt
+    rows = []
+    for m, name in enumerate(snap["names"]):
+        applied = snap["applied"][m]
+        expected = (snap["expected"][m] if snap["expected"] is not None else np.full(3, np.nan))
+        interact = (snap["interact"][m] if snap["interact"] is not None else np.full(3, np.nan))
+        row = dict(step=step, time_s=round(interval_end, 6), body=name,
+                   fx_N=float(applied[0]), fy_N=float(applied[1]), fz_N=float(applied[2]),
+                   f_mag_N=float(np.linalg.norm(applied)),
+                   f_expected_mag_N=float(np.linalg.norm(expected)), safe_limit_N=snap["limit"])
+        for label, vector in [("f_applied", applied), ("f_interact", interact), ("f_expected", expected)]:
+            row.update({f"{label}_{axis}_N": float(value) for axis, value in zip("xyz", vector)})
+        row.update(f_applied_mag_N=float(np.linalg.norm(applied)),
+                   f_interact_mag_N=float(np.linalg.norm(interact)),
+                   applied_expected_error_N=float(np.linalg.norm(applied - expected)),
+                   applied_interact_error_N=float(np.linalg.norm(applied - interact)),
+                   interval_start_s=round(interval_start, 6),
+                   applied_sample_time_s=round(interval_end - physics_dt, 6),
+                   expected_reference_time_s=(round(interval_end, 6)
+                                              if snap["interact"] is not None else float("nan")),
+                   interact_reference_time_s=(round(interval_start + 3 * physics_dt, 6)
+                                              if snap["interact"] is not None else float("nan")))
+        rows.append(row)
+    return rows
+
+
 def _write_force_csv(path: str, records):
     with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "step", "time_s", "body",
-            "fx_N", "fy_N", "fz_N", "f_mag_N", "f_expected_mag_N", "safe_limit_N",
-        ])
+        writer = csv.DictWriter(f, fieldnames=list(records[0]))
+        writer.writeheader()
         writer.writerows(records)
 
 
@@ -498,6 +558,8 @@ def evaluate(
     torch.compiler.cudagraph_mark_step_begin()
     with set_exploration_type(exploration_type):
         for i in tqdm(range(env.max_episode_length), miniters=10):
+            force_reference = (_force_reference_snapshot(env.base_env)
+                               if settle_replay and render and show_force else None)
             s = time.perf_counter()
             tensordict_ = policy(tensordict_)
             e = time.perf_counter()
@@ -533,7 +595,7 @@ def evaluate(
             trajs.append(tensordict.select(*keys, strict=False).cpu())
             if render:
                 frame = env.render("rgb_array")
-                snap = _force_snapshot(env.base_env) if show_force else None
+                snap = _force_snapshot(env.base_env, reference=force_reference) if show_force else None
                 if snap is not None:
                     time_s = (i + 1) * env.step_dt
                     force_history["mag"].append(snap["magnitudes"].copy())
@@ -542,16 +604,8 @@ def evaluate(
                         if len(force_history[key]) > force_max_history:
                             force_history[key].pop(0)
                     frame = _overlay_force(frame, snap, i, time_s, force_history)
-                    for m, name in enumerate(snap["names"]):
-                        fx, fy, fz = (float(v) for v in snap["applied"][m])
-                        exp = float(np.linalg.norm(snap["expected"][m])) if snap["expected"] is not None else float("nan")
-                        force_records.append([
-                            i, round(time_s, 4), name,
-                            round(fx, 4), round(fy, 4), round(fz, 4),
-                            round(float(snap["magnitudes"][m]), 4),
-                            round(exp, 4),
-                            round(float(snap["limit"]), 4),
-                        ])
+                    force_records.extend(_force_record_rows(
+                        snap, i, env.step_dt, env.base_env.physics_dt))
                 if recorder is not None:
                     frame = recorder.overlay(frame)
                 frames.append(frame)
@@ -606,7 +660,7 @@ def evaluate(
         os.makedirs(video_dir, exist_ok=True)
         csv_path = os.path.join(video_dir, f"force-{time_str}.csv")
         _write_force_csv(csv_path, force_records)
-        peak = max(row[6] for row in force_records)
+        peak = max(row["f_mag_N"] for row in force_records)
         info["force/peak"] = peak
         print(f"force log saved to {os.path.abspath(csv_path)} (peak |F| = {peak:.2f} N)")
 

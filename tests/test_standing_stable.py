@@ -1,12 +1,15 @@
 """CPU tensor checks for constant-load replay; no Isaac or policy validation."""
 
 import ast
+import csv
 import importlib.util
 import math
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import tempfile
 
+import numpy as np
 import torch
 
 
@@ -41,6 +44,19 @@ def tensor_command():
 TensorStanding = tensor_command()
 
 
+def force_helpers():
+    namespace = dict(np=np, csv=csv)
+    names = {"_force_reference_snapshot", "_force_snapshot", "_force_record_rows", "_write_force_csv"}
+    tree = ast.parse((ROOT / "scripts/utils/helpers.py").read_text())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "helpers.py", "exec"), namespace)
+    return SimpleNamespace(**{name: namespace[name] for name in names})
+
+
+ForceHelpers = force_helpers()
+
+
 def make_command(magnitude=10., direction=(1., 0., 0.), bodies=None, **schedule):
     c = TensorStanding()
     c.num_envs, c.num_force_bodies, c.device = 1, 6, "cpu"
@@ -59,7 +75,7 @@ def make_command(magnitude=10., direction=(1., 0., 0.), bodies=None, **schedule)
     for name in ["nominal_hand_b", "force_origin_b", "force_dir_b", "force_keypoint_b",
                  "force_keypoint_w", "force_keypoint_vel_w", "force_keypoint_w_prev",
                  "force_applied_w", "force_applied_b", "force_expected_w", "force_expected_b",
-                 "force_pos_delta"]:
+                 "force_pos_delta", "force_interact_b", "force_interact_w"]:
         setattr(c, name, torch.zeros(1, 6, 3))
     c.force_apply_buffer = torch.zeros(1, 7, 3)
     c.torque_apply_buffer = torch.zeros_like(c.force_apply_buffer)
@@ -85,6 +101,7 @@ def make_command(magnitude=10., direction=(1., 0., 0.), bodies=None, **schedule)
     c.set_eval_force_schedule("stable", **schedule)
     c.set_eval_spring(body_names=bodies or ["right_hand_mimic"])
     c.set_eval_stable_force(magnitude, list(direction))
+    c.env.command_manager = c
     return c
 
 
@@ -155,6 +172,47 @@ class StableReplayTests(unittest.TestCase):
                                      (1., [0., 0., 0.]), (1., [float("inf"), 0., 0.])]:
             with self.assertRaises(ValueError):
                 c.set_eval_stable_force(magnitude, direction)
+
+    def test_record_pairs_reference_with_applied_interval_at_onset_and_release(self):
+        c = make_command(start_s=.04, end_s=.08)
+        c.before_update()
+        forces = []
+        for i in range(6):
+            reference = ForceHelpers._force_reference_snapshot(c.env)
+            c.step(0)
+            # Production environment prepares the next reference before logging.
+            c.before_update()
+            snap = ForceHelpers._force_snapshot(c.env, reference=reference)
+            row = ForceHelpers._force_record_rows(snap, i, .02, .005)[5]
+            self.assertAlmostEqual(row["applied_interact_error_N"], 0.)
+            self.assertAlmostEqual(row["applied_expected_error_N"], 0.)
+            self.assertEqual(row["applied_sample_time_s"], row["interact_reference_time_s"])
+            forces.append(row["f_applied_x_N"])
+        self.assertEqual(forces, [0., 0., 10., 10., 0., 0.])
+
+    def test_csv_records_vector_error_and_keeps_legacy_columns(self):
+        snap = dict(names=["right_hand_mimic"], applied=np.array([[10., 0., 0.]]),
+                    expected=np.array([[-10., 0., 0.]]), interact=np.array([[0., 10., 0.]]), limit=10.)
+        rows = ForceHelpers._force_record_rows(snap, 0, .02, .005)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "forces.csv"
+            ForceHelpers._write_force_csv(path, rows)
+            with path.open() as stream:
+                saved = list(csv.DictReader(stream))[0]
+        self.assertEqual(float(saved["f_mag_N"]), float(saved["f_applied_mag_N"]))
+        self.assertEqual(float(saved["f_expected_mag_N"]), 10.)
+        self.assertEqual(float(saved["f_interact_y_N"]), 10.)
+        # Equal magnitudes alone would miss a reversed force vector.
+        self.assertEqual(float(saved["applied_expected_error_N"]), 20.)
+        self.assertAlmostEqual(float(saved["applied_interact_error_N"]), math.sqrt(200))
+
+    def test_virtual_integrator_force_is_distinct_from_final_expected_force(self):
+        c = make_command()
+        c.set_eval_force_schedule("spring")
+        c.force_origin_b[0, 5, 0] = .2
+        c.before_update()
+        self.assertGreater(float(c.force_interact_w[0, 5, 0]),
+                           float(c.force_expected_w[0, 5, 0]))
 
 
 if __name__ == "__main__":

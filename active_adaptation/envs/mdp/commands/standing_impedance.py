@@ -106,6 +106,11 @@ class StandingImpedanceCommand(Command):
         self.force_applied_b = torch.zeros(shape, device=self.device)
         self.force_expected_w = torch.zeros(shape, device=self.device)
         self.force_expected_b = torch.zeros(shape, device=self.device)
+        # Last external force actually used by the virtual integrator, before
+        # its final substep. Unlike force_expected, this is not recomputed at
+        # the final reference position. Populated only for explicit replay.
+        self.force_interact_b = torch.zeros(shape, device=self.device)
+        self.force_interact_w = torch.zeros(shape, device=self.device)
         self.force_pos_delta = torch.zeros(shape, device=self.device)
         self.force_apply_buffer = torch.zeros(self.num_envs, self.asset.num_bodies, 3, device=self.device)
         self.torque_apply_buffer = torch.zeros_like(self.force_apply_buffer)
@@ -203,6 +208,8 @@ class StandingImpedanceCommand(Command):
         self.force_applied_b[env_ids] = 0.0
         self.force_expected_w[env_ids] = 0.0
         self.force_expected_b[env_ids] = 0.0
+        self.force_interact_b[env_ids] = 0.0
+        self.force_interact_w[env_ids] = 0.0
         self.force_keypoint_vel_w[env_ids] = 0.0
         self.force_keypoint_w_prev[env_ids] = 0.0
         self.force_enable[env_ids] = False
@@ -405,6 +412,10 @@ class StandingImpedanceCommand(Command):
                 max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
                 ext = clamp_norm(ext, max_force)
             self.admit.step(drive, ext)
+
+        if self.eval_force_schedule is not None:
+            self.force_interact_b[:] = ext
+            self.force_interact_w[:] = quat_apply(root_quat, ext)
 
         self.force_keypoint_b[:] = self.admit.x[0]
         self.force_keypoint_w[:] = quat_apply(root_quat, self.force_keypoint_b) + root_pos
