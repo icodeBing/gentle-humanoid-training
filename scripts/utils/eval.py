@@ -57,6 +57,18 @@ def eval(cfg):
             raise RuntimeError("The loaded command does not support settle spring replay overrides")
         command.set_eval_spring(**dict(spring))
         print(f"[Replay] settle spring override: {dict(spring)}")
+    stable = cfg.get("eval_settle_stable_force")
+    if stable is not None:
+        command = env.base_env.command_manager
+        command.set_eval_stable_force(**dict(stable))
+        selected = [command.asset.body_names[i] for j, i in enumerate(command.force_apply_idx_asset.tolist())
+                    if bool(command.eval_force_body_mask[j])]
+        print(f"[Replay] Constant WORLD force: {stable.magnitude} N PER BODY on {selected}; "
+              f"direction={stable.direction}. Spring caps and torso counter-wrenches are disabled.")
+        print("[Replay] The same known test load drives the virtual reference; this is not sensorless force estimation.")
+    phase = str(cfg.algo.phase)
+    print(f"[Replay] Policy phase={phase}: "
+          + ("teacher with privileged observations" if phase == "train" else "student with predicted latent features"))
     
     keys = [
         ("next", "stats"),

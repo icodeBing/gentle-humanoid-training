@@ -4,6 +4,7 @@ import os
 import sys
 import hydra
 import argparse
+import math
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -36,14 +37,19 @@ def main():
                         help="Evaluation and recording duration in seconds; defaults to the task episode length.")
     parser.add_argument("--num-envs", type=int, default=None,
                         help="Override the number of parallel environments for evaluation or playback.")
-    parser.add_argument("--settle-force-mode", choices=["random", "off", "spring", "on", "pulse"], default=None,
+    parser.add_argument("--settle-force-mode", choices=["random", "off", "spring", "on", "pulse", "stable"], default=None,
                         help="Deterministic force schedule for StandingImpedance replay.")
     parser.add_argument("--settle-force-start", type=float, default=0.0,
-                        help="Force onset time in seconds for --settle-force-mode pulse.")
+                        help="Force onset time in seconds for pulse or stable replay.")
     parser.add_argument("--settle-force-end", type=float, default=None,
-                        help="Force release time in seconds for --settle-force-mode pulse.")
+                        help="Force release time in seconds; required for pulse, optional for stable.")
     parser.add_argument("--settle-force-ramp", type=float, default=0.0,
-                        help="Force ramp time in seconds for --settle-force-mode pulse.")
+                        help="Ramp up/down time in seconds for pulse or stable (zero gives a step).")
+    parser.add_argument("--settle-force-magnitude", type=float, default=None,
+                        help="Constant load in N PER SELECTED BODY; required for stable mode.")
+    parser.add_argument("--settle-force-direction", nargs=3, type=float, default=None,
+                        metavar=("DX", "DY", "DZ"),
+                        help="Stable force WORLD direction, normalized automatically; default +X.")
     parser.add_argument("--settle-spring-k", type=float, default=None,
                         help="Fixed replay spring stiffness in N/m; otherwise use the task sampler.")
     parser.add_argument("--settle-spring-offset", type=float, default=None,
@@ -61,13 +67,28 @@ def main():
                             "left_wrist_roll_link", "right_wrist_roll_link",
                             "left_hand_mimic", "right_hand_mimic",
                         ],
-                        help="Interaction bodies that receive the replay spring; default: all six.")
+                        help="Bodies that receive the replay load at their centers of mass; default: all six.")
     parser.add_argument("-i", "--iterations", dest="iterations", type=int, default=None)
     parser.add_argument("-s", "--success", action="store_true", default=False)  # test success rate
     add_interaction_arguments(parser)
     args = parser.parse_args()
     if args.settle_force_bodies is not None and args.settle_force_mode is None:
         parser.error("--settle-force-bodies requires --settle-force-mode")
+    if args.settle_force_mode != "stable" and (
+        args.settle_force_magnitude is not None or args.settle_force_direction is not None
+    ):
+        parser.error("--settle-force-magnitude / --settle-force-direction require stable mode")
+    if args.settle_force_mode == "stable":
+        if args.settle_force_magnitude is None:
+            parser.error("stable mode requires --settle-force-magnitude in N per selected body")
+        if not math.isfinite(args.settle_force_magnitude) or args.settle_force_magnitude < 0:
+            parser.error("--settle-force-magnitude must be finite and non-negative")
+        direction = args.settle_force_direction or [1.0, 0.0, 0.0]
+        if not all(math.isfinite(v) for v in direction) or sum(v * v for v in direction) < 1e-12:
+            parser.error("--settle-force-direction must be a finite nonzero vector")
+        if any(v is not None for v in [args.settle_spring_k, args.settle_spring_offset,
+                                       args.settle_spring_direction, args.settle_max_force]):
+            parser.error("stable mode uses magnitude/direction directly; omit spring parameters and --settle-max-force")
 
     if args.checkpoint is not None:
         checkpoint_path = os.path.abspath(args.checkpoint)
@@ -151,7 +172,6 @@ def main():
         cfg["task"]["flags"] = _cfg.task.flags
 
     if args.duration is not None:
-        import math
         if not math.isfinite(args.duration) or args.duration <= 0:
             parser.error("--duration must be greater than zero")
         step_dt = float(cfg.task.sim.step_dt)
@@ -168,15 +188,26 @@ def main():
         print(f"[Info] Evaluation environments: {args.num_envs}")
 
     if args.settle_force_mode is not None:
+        if args.play or args.success or args.experiment is not None:
+            parser.error("--settle-force-mode uses offline replay; omit --play/--success/--experiment")
+        times = [args.settle_force_start, args.settle_force_ramp]
+        if args.settle_force_end is not None:
+            times.append(args.settle_force_end)
+        if not all(math.isfinite(v) for v in times):
+            parser.error("settle force times must be finite")
         if args.settle_force_mode == "pulse" and args.settle_force_end is None:
             parser.error("--settle-force-mode pulse requires --settle-force-end")
         if args.settle_force_start < 0 or args.settle_force_ramp < 0:
             parser.error("settle force times must be non-negative")
         if args.settle_force_end is not None and args.settle_force_end <= args.settle_force_start:
             parser.error("--settle-force-end must be greater than --settle-force-start")
+        if args.settle_force_end is not None and 2 * args.settle_force_ramp > args.settle_force_end - args.settle_force_start:
+            parser.error("require 2*settle-force-ramp <= settle-force-end - settle-force-start")
         target = str(cfg.task.command.get("_target_", ""))
         if not target.endswith("StandingImpedanceCommand"):
             parser.error("--settle-force-mode requires a G1SETTLE/StandingImpedance checkpoint")
+        if args.settle_force_mode == "stable" and not cfg.task.command.get("compliance", True):
+            parser.error("stable replay requires command.compliance=true")
         cfg.eval_settle_force_schedule = dict(
             mode=args.settle_force_mode,
             start_s=args.settle_force_start,
@@ -201,6 +232,11 @@ def main():
             safe_force=args.settle_safe_force,
             body_names=args.settle_force_bodies,
         )
+        if args.settle_force_mode == "stable":
+            cfg.eval_settle_stable_force = dict(
+                magnitude=args.settle_force_magnitude,
+                direction=args.settle_force_direction or [1.0, 0.0, 0.0],
+            )
     
     configure_interaction(args, cfg, parser)
 

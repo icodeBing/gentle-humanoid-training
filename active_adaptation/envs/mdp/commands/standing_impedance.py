@@ -6,6 +6,7 @@ It also integrates a separate, bounded body-level velocity reference from the
 net interaction force.  The latter is a task reference, not a force sensor.
 """
 
+import math
 import re
 
 import torch
@@ -124,6 +125,8 @@ class StandingImpedanceCommand(Command):
         self.eval_max_force = None
         self.eval_safe_force = None
         self.eval_direction_b = None
+        self.eval_stable_magnitude = None
+        self.eval_stable_direction_w = None
         self.eval_force_body_mask = torch.ones(
             self.num_force_bodies, dtype=torch.bool, device=self.device
         )
@@ -218,7 +221,7 @@ class StandingImpedanceCommand(Command):
         ramp_s: float = 0.0,
     ):
         """Set a deterministic force schedule for replay without changing training."""
-        if mode not in {"random", "off", "spring", "on", "pulse"}:
+        if mode not in {"random", "off", "spring", "on", "pulse", "stable"}:
             raise ValueError(f"Unknown evaluation force mode: {mode}")
         if start_s < 0.0 or ramp_s < 0.0:
             raise ValueError("Evaluation force times must be non-negative")
@@ -231,6 +234,34 @@ class StandingImpedanceCommand(Command):
             "ramp_s": float(ramp_s),
         }
         self.eval_force_step.zero_()
+
+    def set_eval_stable_force(self, magnitude: float, direction: list[float]):
+        """Set a constant WORLD-frame force in N per selected body.
+
+        This is an evaluation load, not a spring or force estimate. Both the
+        simulator and virtual reference receive it. Torso counter-wrenches and
+        spring caps are bypassed so the requested physical load is unchanged.
+        """
+        if not math.isfinite(magnitude) or magnitude < 0.0:
+            raise ValueError("Stable force magnitude must be finite and non-negative")
+        direction_t = torch.as_tensor(direction, dtype=torch.float32, device=self.device)
+        if direction_t.shape != (3,) or not torch.isfinite(direction_t).all():
+            raise ValueError("Stable force direction must contain three finite numbers")
+        norm = direction_t.norm()
+        if norm < 1e-6:
+            raise ValueError("Stable force direction must be nonzero")
+        self.eval_stable_magnitude = float(magnitude)
+        self.eval_stable_direction_w = direction_t / norm
+
+    def _is_stable_replay(self):
+        return self.eval_force_schedule is not None and self.eval_force_schedule["mode"] == "stable"
+
+    def _stable_force_w(self):
+        if self.eval_stable_magnitude is None or self.eval_stable_direction_w is None:
+            raise RuntimeError("Stable replay requires magnitude and world direction")
+        vector = self.eval_stable_direction_w * self.eval_stable_magnitude
+        mask = self.eval_force_body_mask.reshape(1, -1, 1)
+        return vector.reshape(1, 1, 3) * self.force_scale.unsqueeze(1) * mask
 
     def set_eval_spring(
         self,
@@ -290,15 +321,20 @@ class StandingImpedanceCommand(Command):
             scale = torch.ones_like(time_s)
         else:
             end_s = schedule["end_s"]
-            if end_s is None:
+            if end_s is None and mode != "stable":
                 raise ValueError("Pulse evaluation schedule requires end_s")
-            active = (time_s >= schedule["start_s"]) & (time_s < end_s)
+            active = time_s >= schedule["start_s"]
+            if end_s is not None:
+                active &= time_s < end_s
             scale = active.float()
             ramp_s = schedule["ramp_s"]
             if ramp_s > 0.0:
                 ramp_in = ((time_s - schedule["start_s"]) / ramp_s).clamp(0.0, 1.0)
-                ramp_out = ((end_s - time_s) / ramp_s).clamp(0.0, 1.0)
-                scale = scale * torch.minimum(ramp_in, ramp_out)
+                if end_s is None:
+                    scale = scale * ramp_in
+                else:
+                    ramp_out = ((end_s - time_s) / ramp_s).clamp(0.0, 1.0)
+                    scale = scale * torch.minimum(ramp_in, ramp_out)
 
         self.force_scale[:] = scale
         self.force_enable[:] = scale.unsqueeze(1) > 0.0
@@ -356,13 +392,18 @@ class StandingImpedanceCommand(Command):
         force_limit = self.safe_force_limit.unsqueeze(1)
         drive_kp = force_limit / 0.05
         drive_kd = 2.0 * torch.sqrt(drive_kp * 0.1)
+        stable_w = self._stable_force_w() if self._is_stable_replay() else None
+        stable_b = quat_apply_inverse(root_quat, stable_w) if stable_w is not None else None
         for _ in range(4):
             drive = drive_kp * (self.nominal_hand_b - self.admit.x[0]) - drive_kd * self.admit.v[0]
             drive = clamp_norm(drive, force_limit)
-            delta = self.force_origin_b - self.admit.x[0]
-            ext = self.force_kp * delta
-            max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
-            ext = clamp_norm(ext, max_force)
+            if stable_b is not None:
+                ext = stable_b
+            else:
+                delta = self.force_origin_b - self.admit.x[0]
+                ext = self.force_kp * delta
+                max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
+                ext = clamp_norm(ext, max_force)
             self.admit.step(drive, ext)
 
         self.force_keypoint_b[:] = self.admit.x[0]
@@ -373,9 +414,10 @@ class StandingImpedanceCommand(Command):
             self.force_keypoint_vel_w[new_ids] = 0.0
         self.force_keypoint_w_prev[:] = self.force_keypoint_w
         max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
-        expected_b = clamp_norm(self.force_kp * (self.force_origin_b - self.force_keypoint_b), max_force)
+        expected_b = (stable_b if stable_b is not None else
+                      clamp_norm(self.force_kp * (self.force_origin_b - self.force_keypoint_b), max_force))
         self.force_expected_b[:] = expected_b
-        self.force_expected_w[:] = quat_apply(root_quat, expected_b)
+        self.force_expected_w[:] = stable_w if stable_w is not None else quat_apply(root_quat, expected_b)
 
         # Body-level admittance: the reference is explicitly bounded and is
         # independent from the hand admittance mass used above.
@@ -400,6 +442,14 @@ class StandingImpedanceCommand(Command):
         if not self.compliance:
             return
         root_quat = self.asset.data.root_quat_w.unsqueeze(1)
+        if self._is_stable_replay():
+            self.force_applied_w[:] = self._stable_force_w()
+            self.force_applied_b[:] = quat_apply_inverse(root_quat, self.force_applied_w)
+            self.force_apply_buffer[:, self.force_apply_idx_asset] = self.force_applied_w
+            # Keep the requested load exact. It acts at each selected rigid
+            # body's center of mass; off-center forces naturally induce torque.
+            self.asset.has_external_wrench = False
+            return
         hand_pos = self.asset.data.body_pos_w[:, self.force_apply_idx_asset]
         hand_delta = self.force_origin_b
         current_b = quat_apply_inverse(root_quat, hand_pos - self.asset.data.root_pos_w.unsqueeze(1))
