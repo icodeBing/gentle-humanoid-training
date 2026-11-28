@@ -33,6 +33,9 @@ class StandingImpedanceCommand(Command):
         net_torque_limit: float = 35.0,
         compliance: bool = True,
         hand_offset: float = 0.20,
+        hand_offset_range: tuple[float, float] | None = None,
+        hand_offset_random_prob: float = 0.5,
+        force_body_sampling: str = "independent",
         hand_stiffness_range: tuple[float, float] = (5.0, 250.0),
         safe_force_range: tuple[float, float] = (5.0, 15.0),
         force_time_range: tuple[int, int] = (100, 500),
@@ -45,6 +48,16 @@ class StandingImpedanceCommand(Command):
         drive_damping: float = 2.0,
         drive_vel_limit: float = 4.0,
         drive_acc_limit: float = 1000.0,
+        following_rewards: bool = False,
+        hand_reference_limit: float | None = None,
+        tracking_sigma: float = 0.10,
+        moving_speed_threshold: float = 0.05,
+        tracking_tolerance: float = 0.05,
+        threshold_following: bool = False,
+        constant_load_probability: float = 0.5,
+        constant_excess_range: tuple[float, float] = (2.0, 20.0),
+        load_curriculum_fraction: float = 0.25,
+        student_train: bool = False,
         body_patterns: list[str] = [".*shoulder_yaw_link", ".*wrist_roll_link", ".*hand_mimic"],
         lower_joint_pattern: str = ".*(waist|hip|knee|ankle).*",
         **kwargs,
@@ -56,8 +69,49 @@ class StandingImpedanceCommand(Command):
         self.net_torque_limit = torch.as_tensor(net_torque_limit, device=self.device)
         self.compliance = bool(compliance)
         self.hand_offset = float(hand_offset)
+        self.hand_offset_range = None if hand_offset_range is None else tuple(float(x) for x in hand_offset_range)
+        self.hand_offset_random_prob = float(hand_offset_random_prob)
+        if self.hand_offset_range is not None and (
+            len(self.hand_offset_range) != 2
+            or not all(math.isfinite(x) for x in self.hand_offset_range)
+            or not 0.0 <= self.hand_offset_range[0] <= self.hand_offset_range[1]
+        ):
+            raise ValueError("hand_offset_range must be two finite, ordered non-negative distances")
+        if not 0.0 <= self.hand_offset_random_prob <= 1.0:
+            raise ValueError("hand_offset_random_prob must be between zero and one")
+        self.following_rewards = bool(following_rewards)
+        # Opt in through the new task config; old checkpoint configs keep their
+        # original observations, reward semantics and replay dynamics.
+        self.threshold_following = bool(threshold_following)
+        self.constant_load_probability = float(constant_load_probability)
+        self.constant_excess_range = tuple(float(x) for x in constant_excess_range)
+        self.load_curriculum_fraction = float(load_curriculum_fraction)
+        self.student_train = bool(student_train)
+        self.load_curriculum_scale = 1.0 if student_train else 0.35
+        if not 0 <= self.constant_load_probability <= 1:
+            raise ValueError("constant_load_probability must be in [0, 1]")
+        if (len(self.constant_excess_range) != 2
+                or not all(math.isfinite(x) for x in self.constant_excess_range)
+                or not 0 <= self.constant_excess_range[0] <= self.constant_excess_range[1]):
+            raise ValueError("constant_excess_range must be finite, ordered and non-negative")
+        if not math.isfinite(self.load_curriculum_fraction) or self.load_curriculum_fraction <= 0:
+            raise ValueError("load_curriculum_fraction must be positive")
+        if force_body_sampling not in {"independent", "balanced_hands"}:
+            raise ValueError("Unknown force_body_sampling mode")
+        self.force_body_sampling = force_body_sampling
+        self.hand_reference_limit = hand_reference_limit
+        if hand_reference_limit is not None and (not math.isfinite(hand_reference_limit) or hand_reference_limit <= 0):
+            raise ValueError("hand_reference_limit must be finite and positive")
+        self.tracking_sigma = float(tracking_sigma)
+        self.moving_speed_threshold = float(moving_speed_threshold)
+        self.tracking_tolerance = float(tracking_tolerance)
+        if not all(math.isfinite(x) and x > 0 for x in
+                   (self.tracking_sigma, self.moving_speed_threshold, self.tracking_tolerance)):
+            raise ValueError("Tracking scales and thresholds must be finite and positive")
         self.hand_stiffness_range = tuple(float(x) for x in hand_stiffness_range)
         self.safe_force_range = tuple(float(x) for x in safe_force_range)
+        if not 5 <= self.safe_force_range[0] <= self.safe_force_range[1] <= 15:
+            raise ValueError("safe_force_range must stay within 5..15 N")
         self.force_time_range = tuple(int(x) for x in force_time_range)
         self.ramp_time_range = tuple(int(x) for x in ramp_time_range)
         self.body_mass = float(body_mass)
@@ -73,6 +127,9 @@ class StandingImpedanceCommand(Command):
             raise ValueError(f"No interaction bodies matched {body_patterns}")
         self.force_apply_idx_asset = torch.tensor(body_ids, device=self.device, dtype=torch.long)
         self.num_force_bodies = len(body_ids)
+        self.hand_force_indices = [j for j, i in enumerate(body_ids) if "hand_mimic" in self.asset.body_names[i]]
+        if force_body_sampling == "balanced_hands" and len(self.hand_force_indices) != 2:
+            raise ValueError("balanced_hands sampling requires left and right hand bodies")
         self.torso_idx_asset = next(
             (i for i, name in enumerate(self.asset.body_names) if re.match(".*torso.*|.*pelvis.*", name)),
             0,
@@ -88,6 +145,8 @@ class StandingImpedanceCommand(Command):
         self.nominal_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.force_origin_b = torch.zeros(shape, device=self.device)
         self.force_dir_b = torch.zeros(shape, device=self.device)
+        # Share the sampled distance across body points in an environment.
+        self.force_offset = torch.full((self.num_envs, 1, 1), self.hand_offset, device=self.device)
         self.force_kp_nominal = torch.zeros(self.num_envs, self.num_force_bodies, 1, device=self.device)
         self.force_kp = torch.zeros(self.num_envs, self.num_force_bodies, 1, device=self.device)
         self.force_enable = torch.zeros(self.num_envs, self.num_force_bodies, 1, dtype=torch.bool, device=self.device)
@@ -97,6 +156,11 @@ class StandingImpedanceCommand(Command):
         self.force_ramping_down = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.force_scale = torch.zeros(self.num_envs, 1, device=self.device)
         self.safe_force_limit = torch.zeros(self.num_envs, 1, device=self.device)
+        self.load_is_constant = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.constant_force_w = torch.zeros(shape, device=self.device)
+        self.load_age = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.load_ramp_steps = torch.ones_like(self.load_age)
+        self.load_hold_steps = torch.ones_like(self.load_age)
 
         self.force_keypoint_b = torch.zeros(shape, device=self.device)
         self.force_keypoint_w = torch.zeros(shape, device=self.device)
@@ -111,16 +175,37 @@ class StandingImpedanceCommand(Command):
         # the final reference position. Populated only for explicit replay.
         self.force_interact_b = torch.zeros(shape, device=self.device)
         self.force_interact_w = torch.zeros(shape, device=self.device)
+        self.force_drive_b = torch.zeros(shape, device=self.device)
+        self.force_drive_w = torch.zeros(shape, device=self.device)
         self.force_pos_delta = torch.zeros(shape, device=self.device)
         self.force_apply_buffer = torch.zeros(self.num_envs, self.asset.num_bodies, 3, device=self.device)
         self.torque_apply_buffer = torch.zeros_like(self.force_apply_buffer)
         self.force_apply_world = True
 
         self.root_vel_ref_w = torch.zeros(self.num_envs, 3, device=self.device)
+        # Known physical load at the START of the next control interval. This
+        # must not be confused with the spring evaluated at the virtual hand.
+        self.follow_input_force_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self.follow_excess_force_w = torch.zeros_like(self.follow_input_force_w)
         self.root_pos_ref_w = torch.zeros(self.num_envs, 3, device=self.device)
         self.root_height_ref = torch.zeros(self.num_envs, 1, device=self.device)
+        self.heading_ref_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self.heading_ref_w[:, 0] = 1.0
+        self.metric_sums = torch.zeros(16, device=self.device)
+        self.threshold_metric_sums = torch.zeros(6, device=self.device)
+        self.contact_sensor = None
+        self.foot_asset_ids = []
+        self.foot_sensor_ids = []
+        if self.following_rewards:
+            self.contact_sensor = self.env.scene["contact_forces"]
+            self.foot_asset_ids, _ = self.asset.find_bodies(".*ankle_roll_link")
+            self.foot_sensor_ids, _ = self.contact_sensor.find_bodies(".*ankle_roll_link")
+            if len(self.foot_asset_ids) != 2 or len(self.foot_sensor_ids) != 2:
+                raise ValueError("Following rewards require two ankle contact bodies")
         self.joint_pos_boot_protect = self.init_joint_pos.clone()
         self._cum_error = torch.zeros(self.num_envs, 3, device=self.device)
+        self._reward_reference = {}
+        self._reward_reference_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.skip_ref = True
         # Optional deterministic schedule used only by evaluation replay.
         self.eval_force_schedule = None
@@ -164,8 +249,8 @@ class StandingImpedanceCommand(Command):
             direction = self.eval_direction_b.reshape(1, 1, 3).expand(n, 1, 3)
         direction = direction.expand(-1, self.num_force_bodies, -1)
         self.force_dir_b[env_ids] = direction
-        offset = self.hand_offset if self.eval_spring_offset is None else self.eval_spring_offset
-        self.force_origin_b[env_ids] = self.nominal_hand_b[env_ids] + direction * offset
+        self.force_offset[env_ids] = self._sample_offset(n)
+        self.force_origin_b[env_ids] = self.nominal_hand_b[env_ids] + direction * self.force_offset[env_ids]
         if self.eval_spring_k is None:
             self.force_kp[env_ids] = torch.empty(n, self.num_force_bodies, 1, device=self.device).uniform_(*self.hand_stiffness_range)
         else:
@@ -173,11 +258,7 @@ class StandingImpedanceCommand(Command):
         # Mask stiffness at reset as well, before the first physics step.
         self.force_kp[env_ids] *= self.eval_force_body_mask.reshape(1, -1, 1)
         self.force_kp_nominal[env_ids] = self.force_kp[env_ids]
-        active = torch.rand(n, self.num_force_bodies, 1, device=self.device) > 0.25
-        active &= self.eval_force_body_mask.reshape(1, -1, 1)
-        idle = torch.rand(n, 1, 1, device=self.device) < 0.25
-        active &= ~idle
-        self.force_enable[env_ids] = active
+        self.force_enable[env_ids] = self._sample_active_mask(n)
         self.force_timer[env_ids] = torch.randint(
             self.force_time_range[0], self.force_time_range[1] + 1, (n,),
             device=self.device, dtype=self.force_timer.dtype,
@@ -187,6 +268,71 @@ class StandingImpedanceCommand(Command):
             self.safe_force_limit[env_ids] = torch.empty(n, 1, device=self.device).uniform_(*self.safe_force_range)
         else:
             self.safe_force_limit[env_ids] = self.eval_safe_force
+        if self.threshold_following:
+            self.load_is_constant[env_ids] = torch.rand(n, device=self.device) < self.constant_load_probability
+            self.load_age[env_ids] = 0
+            self.load_ramp_steps[env_ids] = torch.randint(
+                self.ramp_time_range[0], self.ramp_time_range[1] + 1, (n,), device=self.device)
+            self.load_hold_steps[env_ids] = self.force_timer[env_ids].to(self.load_hold_steps.dtype)
+            # Stratify the TOTAL planar load around safe, independent of the
+            # number of active links: 1/3 below, 1/3 near, 1/3 clearly above.
+            total = self._sample_constant_magnitude(self.safe_force_limit[env_ids])
+            planar_b = direction[:, 0].clone()
+            planar_b[:, 2] = 0.0
+            planar_b /= planar_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            planar_w = quat_apply(self.asset.data.root_quat_w[env_ids], planar_b)
+            planar_w[:, 2] = 0.0
+            planar_w /= planar_w.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            mask = self.force_enable[env_ids].to(total.dtype)
+            count = mask.sum(dim=1).clamp_min(1.0)
+            self.constant_force_w[env_ids] = planar_w.unsqueeze(1) * (total / count).unsqueeze(1) * mask
+            # Mixed training starts unloaded and ramps in, including at reset.
+            self.force_scale[env_ids] = 0.0
+
+    def _sample_constant_magnitude(self, safe):
+        regime = torch.rand_like(safe)
+        u = torch.rand_like(safe)
+        below = safe * (0.2 + 0.7 * u)
+        near = safe * (0.9 + 0.2 * u)
+        lo, hi = self.constant_excess_range
+        above = safe + (lo + (hi - lo) * u) * self.load_curriculum_scale
+        return torch.minimum(torch.where(regime < 1/3, below,
+                             torch.where(regime < 2/3, near, above)), self.net_force_limit)
+
+    def step_schedule(self, progress: float):
+        if self.student_train:
+            self.load_curriculum_scale = 1.0
+        else:
+            fraction = min(max(progress / self.load_curriculum_fraction, 0.0), 1.0)
+            self.load_curriculum_scale = 0.35 + 0.65 * fraction
+
+    def _sample_offset(self, n: int):
+        offset = torch.full((n, 1, 1), self.hand_offset, device=self.device)
+        if self.eval_spring_offset is not None:
+            return offset.fill_(self.eval_spring_offset)
+        if self.hand_offset_range is not None:
+            sampled = torch.empty_like(offset).uniform_(*self.hand_offset_range)
+            randomize = torch.rand(n, 1, 1, device=self.device) < self.hand_offset_random_prob
+            offset = torch.where(randomize, sampled, offset)
+        return offset
+
+    def _sample_active_mask(self, n: int):
+        active = torch.rand(n, self.num_force_bodies, 1, device=self.device) > 0.25
+        if self.force_body_sampling == "balanced_hands":
+            # Event mixture: 20% idle, 40% one hand, 20% both hands, and
+            # 20% independently sampled upper-body contacts.
+            choice = torch.rand(n, device=self.device)
+            active[choice < 0.8] = False
+            hand_ids = torch.as_tensor(self.hand_force_indices, device=self.device)
+            selected_hand = hand_ids[torch.randint(0, 2, (n,), device=self.device)]
+            row = torch.arange(n, device=self.device)
+            single = (choice >= 0.2) & (choice < 0.6)
+            active[row[single], selected_hand[single], 0] = True
+            both = (choice >= 0.6) & (choice < 0.8)
+            active[:, hand_ids, 0] |= both.unsqueeze(-1)
+        else:
+            active &= ~(torch.rand(n, 1, 1, device=self.device) < 0.25)
+        return active & self.eval_force_body_mask.reshape(1, -1, 1)
 
     def sample_init(self, env_ids: torch.Tensor):
         root_state = self.init_root_state[env_ids].clone()
@@ -198,9 +344,15 @@ class StandingImpedanceCommand(Command):
         self.asset.set_joint_position_target(self.init_joint_pos[env_ids], env_ids=env_ids)
         self.asset.write_data_to_sim()
         self.nominal_initialized[env_ids] = False
+        self._reward_reference_valid[env_ids] = False
         self.root_vel_ref_w[env_ids] = 0.0
+        self.follow_input_force_w[env_ids] = 0.0
+        self.follow_excess_force_w[env_ids] = 0.0
         self.root_pos_ref_w[env_ids] = root_state[:, :3]
         self.root_height_ref[env_ids] = root_state[:, 2:3]
+        forward = torch.zeros(len(env_ids), 3, device=self.device)
+        forward[:, 0] = 1.0
+        self.heading_ref_w[env_ids] = quat_apply(root_state[:, 3:7], forward)
         self.force_reset(env_ids)
 
     def force_reset(self, env_ids: torch.Tensor):
@@ -269,6 +421,54 @@ class StandingImpedanceCommand(Command):
         vector = self.eval_stable_direction_w * self.eval_stable_magnitude
         mask = self.eval_force_body_mask.reshape(1, -1, 1)
         return vector.reshape(1, 1, 3) * self.force_scale.unsqueeze(1) * mask
+
+    def _constant_mask(self):
+        if self._is_stable_replay():
+            return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        random_schedule = self.eval_force_schedule is None or self.eval_force_schedule["mode"] == "random"
+        if self.threshold_following and random_schedule:
+            return self.load_is_constant
+        return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def _constant_load_w(self):
+        if self._is_stable_replay():
+            return self._stable_force_w()
+        return self.constant_force_w * self.force_scale.unsqueeze(1) * self.force_enable
+
+    def _physical_load_w(self, current_b):
+        max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
+        spring_b = clamp_norm(self.force_kp * (self.force_origin_b - current_b), max_force)
+        spring_w = quat_apply(self.asset.data.root_quat_w.unsqueeze(1), spring_b)
+        load = torch.where(self._constant_mask()[:, None, None], self._constant_load_w(), spring_w)
+        if self.threshold_following and not self._is_stable_replay():
+            # Limit the actual resultant, rather than hiding it with a torso
+            # counter-force. Use the identical law in the virtual reference.
+            net_norm = load.sum(dim=1).norm(dim=-1, keepdim=True)
+            scale = (self.net_force_limit / net_norm.clamp_min(1e-6)).clamp_max(1.0)
+            load = load * scale.unsqueeze(-1)
+        return load
+
+    def _update_body_reference(self, physical_force_w):
+        if self.threshold_following:
+            # One threshold on the resultant horizontal load, not one safe
+            # budget per link. Opposing two-hand forces do not command walking.
+            total = physical_force_w.sum(dim=1).clone()
+            total[:, 2] = 0.0
+            self.follow_input_force_w[:] = total
+            magnitude = total.norm(dim=-1, keepdim=True)
+            excess = (magnitude - self.safe_force_limit).clamp_min(0.0)
+            total = total * excess / magnitude.clamp_min(1e-6)
+            total = clamp_norm(total, self.net_force_limit)
+            self.follow_excess_force_w[:] = total
+        else:
+            total = clamp_norm(self.force_expected_w.sum(dim=1), self.net_force_limit)
+            if self.following_rewards:
+                total[:, 2] = 0.0
+        acceleration = clamp_norm(
+            (total - self.body_damping * self.root_vel_ref_w) / self.body_mass, self.body_acc_limit)
+        self.root_vel_ref_w[:] = clamp_norm(
+            self.root_vel_ref_w + acceleration * self.env.step_dt, self.body_vel_limit)
+        self.root_pos_ref_w[:] = self.asset.data.root_pos_w + self.root_vel_ref_w * self.env.step_dt
 
     def set_eval_spring(
         self,
@@ -350,6 +550,9 @@ class StandingImpedanceCommand(Command):
         self.eval_force_step += 1
 
     def _update_schedule(self):
+        if self.threshold_following:
+            self._update_mixed_schedule()
+            return
         self.force_timer -= 1
         active = self.force_enable.any(dim=(1, 2))
         begin_down = (self.force_timer <= 0) & active & (~self.force_ramping_down)
@@ -375,6 +578,20 @@ class StandingImpedanceCommand(Command):
                 self.force_ramping_down[ids] = False
         self.force_kp = self.force_kp_nominal * self.force_enable * self.force_scale.unsqueeze(-1)
 
+    def _update_mixed_schedule(self):
+        # A force event is ramp-in, hold, ramp-out, then resample. Idle events
+        # retain their all-zero mask for the complete interval.
+        self.load_age += 1
+        total_steps = self.load_hold_steps + 2 * self.load_ramp_steps
+        done = self.load_age >= total_steps
+        if done.any():
+            self._sample_force(done.nonzero(as_tuple=False).squeeze(-1))
+        ramp = self.load_ramp_steps.float().clamp_min(1)
+        ramp_in = self.load_age.float() / ramp
+        ramp_out = (self.load_hold_steps + 2 * self.load_ramp_steps - self.load_age).float() / ramp
+        self.force_scale[:] = torch.minimum(ramp_in, ramp_out).clamp(0, 1).unsqueeze(-1)
+        self.force_kp = self.force_kp_nominal * self.force_enable * self.force_scale.unsqueeze(1)
+
     def before_update(self):
         new_ids = None
         if (~self.nominal_initialized).any():
@@ -383,8 +600,7 @@ class StandingImpedanceCommand(Command):
             current = self._current_hand_b().detach()
             self.nominal_hand_b[ids] = current[ids]
             self.nominal_initialized[ids] = True
-            offset = self.hand_offset if self.eval_spring_offset is None else self.eval_spring_offset
-            self.force_origin_b[ids] = self.nominal_hand_b[ids] + self.force_dir_b[ids] * offset
+            self.force_origin_b[ids] = self.nominal_hand_b[ids] + self.force_dir_b[ids] * self.force_offset[ids]
             self.admit.reset(ids, self.nominal_hand_b[ids], torch.zeros_like(self.nominal_hand_b[ids]))
 
         if not self.compliance:
@@ -399,23 +615,18 @@ class StandingImpedanceCommand(Command):
         force_limit = self.safe_force_limit.unsqueeze(1)
         drive_kp = force_limit / 0.05
         drive_kd = 2.0 * torch.sqrt(drive_kp * 0.1)
-        stable_w = self._stable_force_w() if self._is_stable_replay() else None
-        stable_b = quat_apply_inverse(root_quat, stable_w) if stable_w is not None else None
+        physical_w = self._physical_load_w(current_b)
         for _ in range(4):
             drive = drive_kp * (self.nominal_hand_b - self.admit.x[0]) - drive_kd * self.admit.v[0]
             drive = clamp_norm(drive, force_limit)
-            if stable_b is not None:
-                ext = stable_b
-            else:
-                delta = self.force_origin_b - self.admit.x[0]
-                ext = self.force_kp * delta
-                max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
-                ext = clamp_norm(ext, max_force)
+            ext = quat_apply_inverse(root_quat, self._physical_load_w(self.admit.x[0]))
             self.admit.step(drive, ext)
+            self._bound_hand_reference()
+        self.force_drive_b[:] = drive
+        self.force_drive_w[:] = quat_apply(root_quat, drive)
 
-        if self.eval_force_schedule is not None:
-            self.force_interact_b[:] = ext
-            self.force_interact_w[:] = quat_apply(root_quat, ext)
+        self.force_interact_b[:] = ext
+        self.force_interact_w[:] = quat_apply(root_quat, ext)
 
         self.force_keypoint_b[:] = self.admit.x[0]
         self.force_keypoint_w[:] = quat_apply(root_quat, self.force_keypoint_b) + root_pos
@@ -424,32 +635,139 @@ class StandingImpedanceCommand(Command):
             self.force_keypoint_w_prev[new_ids] = self.force_keypoint_w[new_ids]
             self.force_keypoint_vel_w[new_ids] = 0.0
         self.force_keypoint_w_prev[:] = self.force_keypoint_w
-        max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
-        expected_b = (stable_b if stable_b is not None else
-                      clamp_norm(self.force_kp * (self.force_origin_b - self.force_keypoint_b), max_force))
+        expected_w = self._physical_load_w(self.force_keypoint_b)
+        expected_b = quat_apply_inverse(root_quat, expected_w)
         self.force_expected_b[:] = expected_b
-        self.force_expected_w[:] = stable_w if stable_w is not None else quat_apply(root_quat, expected_b)
+        self.force_expected_w[:] = expected_w
 
         # Body-level admittance: the reference is explicitly bounded and is
         # independent from the hand admittance mass used above.
-        total_force = self.force_expected_w.sum(dim=1)
-        total_force = clamp_norm(total_force, self.net_force_limit)
-        root_acc = (total_force - self.body_damping * self.root_vel_ref_w) / self.body_mass
-        root_acc = clamp_norm(root_acc, self.body_acc_limit)
-        self.root_vel_ref_w[:] = clamp_norm(self.root_vel_ref_w + root_acc * self.env.step_dt, self.body_vel_limit)
-        self.root_pos_ref_w[:] = self.asset.data.root_pos_w + self.root_vel_ref_w * self.env.step_dt
+        self._update_body_reference(physical_w)
 
         self._cum_error[:, 0] = (self.asset.data.root_pos_w[:, 2] - self.root_height_ref[:, 0]).abs()
         self._cum_error[:, 1] = self.asset.data.projected_gravity_b[:, :2].norm(dim=-1)
         self._cum_error[:, 2] = (self.force_keypoint_w - self.asset.data.body_pos_w[:, self.force_apply_idx_asset]).norm(dim=-1).mean(dim=-1)
 
     def update(self):
-        pass
+        if self.following_rewards:
+            self._accumulate_tracking_metrics()
+
+    def _bound_hand_reference(self):
+        if self.hand_reference_limit is None:
+            return
+        delta = self.admit.x[0] - self.nominal_hand_b
+        distance = delta.norm(dim=-1, keepdim=True)
+        direction = delta / distance.clamp_min(1e-6)
+        outside = distance > self.hand_reference_limit
+        self.admit.x[0] = self.nominal_hand_b + clamp_norm(delta, self.hand_reference_limit)
+        # Anti-windup: discard only outward velocity at the displacement bound.
+        outward = (self.admit.v[0] * direction).sum(-1, keepdim=True).clamp_min(0.0)
+        self.admit.v[0] -= outside * outward * direction
+
+    def _moving(self):
+        target = self._reward_value("velocity", self.root_vel_ref_w)
+        return target[:, :2].norm(dim=-1, keepdim=True) > self.moving_speed_threshold
+
+    def _reward_value(self, name, current):
+        # BaseEnv prepares the NEXT command before computing this interval's
+        # reward. Compare physical outcomes with the command actually executed.
+        if not self.threshold_following or name not in self._reward_reference:
+            return current
+        valid = self._reward_reference_valid.reshape((-1,) + (1,) * (current.ndim - 1))
+        return torch.where(valid, self._reward_reference[name], current)
+
+    def _active_force_mean(self, values):
+        mask = self._reward_value("enabled", self.force_enable).squeeze(-1).to(values.dtype)
+        return (values * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp_min(1.0)
+
+    def _heading_error(self):
+        forward = torch.zeros_like(self.heading_ref_w)
+        forward[:, 0] = 1.0
+        current = quat_apply(self.asset.data.root_quat_w, forward)[:, :2]
+        reference = self.heading_ref_w[:, :2]
+        cross = current[:, 0] * reference[:, 1] - current[:, 1] * reference[:, 0]
+        dot = (current * reference).sum(-1)
+        return torch.atan2(cross, dot).unsqueeze(-1)
+
+    def _accumulate_tracking_metrics(self):
+        moving = self._moving().squeeze(-1)
+        speed = self.asset.data.root_lin_vel_w[:, :2]
+        target = self._reward_value("velocity", self.root_vel_ref_w)[:, :2]
+        target_speed = target.norm(dim=-1)
+        error = (speed - target).norm(dim=-1)
+        progress = (speed * target).sum(-1) / target_speed.square().clamp_min(1e-6)
+        active = self._reward_value("enabled", self.force_enable).squeeze(-1)
+        expected = self._reward_value("expected", self.force_expected_w)
+        hand_target = self._reward_value("hand_position", self.force_keypoint_w)
+        force_error = (self.force_applied_w-expected).norm(dim=-1)
+        hand_error = (self.asset.data.body_pos_w[:, self.force_apply_idx_asset]-hand_target).norm(dim=-1)
+        contact = self.contact_sensor.data.current_contact_time[:, self.foot_sensor_ids] > 0
+        foot_speed = self.asset.data.body_lin_vel_w[:, self.foot_asset_ids, :2].norm(dim=-1)
+        tracked = moving & (error < self.tracking_tolerance) & (progress >= 0.8)
+        values = [
+            moving.sum(), (~moving).sum(), (error * moving).sum(),
+            (speed.norm(dim=-1) * moving).sum(), (target_speed * moving).sum(),
+            (progress * moving).sum(), tracked.sum(),
+            (speed.norm(dim=-1) * (~moving)).sum(),
+            self.asset.data.root_ang_vel_w[:, 2].abs().sum(),
+            self._heading_error().abs().sum(), (force_error * active).sum(),
+            active.sum(), (hand_error * active).sum(), (foot_speed * contact).sum(),
+            contact.sum(), (contact.sum(-1) == 1).sum(),
+        ]
+        self.metric_sums += torch.stack(values)
+        if self.threshold_following:
+            norm = self._reward_value("input", self.follow_input_force_w).norm(dim=-1)
+            excess = self._reward_value("excess", self.follow_excess_force_w).norm(dim=-1)
+            bound = (self.force_keypoint_b - self.nominal_hand_b).norm(dim=-1)
+            at_bound = (bound >= self.hand_reference_limit - 1e-5).float().mean(-1) if self.hand_reference_limit else torch.zeros_like(norm)
+            self.threshold_metric_sums += torch.stack([
+                self._reward_value("constant", self._constant_mask()).float().sum(),
+                (norm > self._reward_value("safe", self.safe_force_limit)[:, 0]).float().sum(),
+                norm.sum(), excess.sum(), at_bound.sum(), torch.ones_like(norm).sum()])
+
+    def tracking_diagnostics(self):
+        """Conditional physical metrics since the last training log call."""
+        if not self.following_rewards:
+            return {}
+        s = self.metric_sums
+        count = (s[0] + s[1]).clamp_min(1)
+        moving_count = s[0].clamp_min(1)
+        rest_count = s[1].clamp_min(1)
+        active_count = s[11].clamp_min(1)
+        names = ["moving_fraction", "moving_velocity_error_m_s", "moving_actual_speed_m_s",
+                 "moving_target_speed_m_s", "moving_progress_ratio", "moving_tracking_fraction",
+                 "rest_speed_m_s", "yaw_rate_abs_rad_s", "heading_error_abs_rad",
+                 "active_force_error_N", "active_hand_error_m", "contact_slip_speed_m_s",
+                 "single_support_fraction", "moving_samples", "rest_samples", "active_force_samples"]
+        values = torch.stack([
+            s[0]/count, s[2]/moving_count, s[3]/moving_count, s[4]/moving_count,
+            s[5]/moving_count, s[6]/moving_count, s[7]/rest_count, s[8]/count,
+            s[9]/count, s[10]/active_count, s[12]/active_count,
+            s[13]/s[14].clamp_min(1), s[15]/count, s[0], s[1], s[11],
+        ]).detach().cpu().tolist()
+        self.metric_sums.zero_()
+        result = {f"settle/{name}": value for name, value in zip(names, values)}
+        if self.threshold_following:
+            stats = self.threshold_metric_sums
+            extra_names = ["constant_load_fraction", "over_safe_fraction", "known_planar_load_N",
+                           "follow_excess_N", "hand_reference_bound_fraction"]
+            extra_values = (stats[:5] / stats[5].clamp_min(1)).detach().cpu().tolist()
+            result.update({f"settle/{name}": value for name, value in zip(extra_names, extra_values)})
+            result["settle/load_curriculum_scale"] = self.load_curriculum_scale
+            stats.zero_()
+        return result
 
     def step(self, substep: int):
         if substep == 0:
             self.force_apply_buffer.zero_()
             self.torque_apply_buffer.zero_()
+            if self.threshold_following:
+                self._reward_reference = {name: value.clone() for name, value in dict(
+                    velocity=self.root_vel_ref_w, expected=self.force_expected_w,
+                    hand_position=self.force_keypoint_w, hand_velocity=self.force_keypoint_vel_w,
+                    enabled=self.force_enable, constant=self._constant_mask(), safe=self.safe_force_limit,
+                    input=self.follow_input_force_w, excess=self.follow_excess_force_w).items()}
+                self._reward_reference_valid[:] = True
         if not self.compliance:
             return
         root_quat = self.asset.data.root_quat_w.unsqueeze(1)
@@ -462,17 +780,21 @@ class StandingImpedanceCommand(Command):
             self.asset.has_external_wrench = False
             return
         hand_pos = self.asset.data.body_pos_w[:, self.force_apply_idx_asset]
-        hand_delta = self.force_origin_b
         current_b = quat_apply_inverse(root_quat, hand_pos - self.asset.data.root_pos_w.unsqueeze(1))
-        max_force = self.max_force if self.eval_max_force is None else self.eval_max_force
-        force_b = clamp_norm(self.force_kp * (hand_delta - current_b), max_force)
-        self.force_applied_w[:] = quat_apply(root_quat, force_b)
-        self.force_applied_b[:] = force_b
+        self.force_applied_w[:] = self._physical_load_w(current_b)
+        self.force_applied_b[:] = quat_apply_inverse(root_quat, self.force_applied_w)
         self.force_apply_buffer[:, self.force_apply_idx_asset] = self.force_applied_w
         hand_quat = self.asset.data.body_quat_w[:, self.force_apply_idx_asset]
         delta_w = quat_apply(hand_quat, self.force_pos_delta)
         self.torque_apply_buffer[:, self.force_apply_idx_asset] = torch.cross(delta_w, self.force_applied_w, dim=-1)
-        self._limit_net_wrench()
+        if self.threshold_following:
+            # Train on the same uncompensated physical wrench used by stable
+            # replay. A torso counter-wrench would conceal single-hand torque.
+            constant = self._constant_mask()[:, None, None]
+            self.torque_apply_buffer[:, self.force_apply_idx_asset] *= ~constant
+            self.asset.has_external_wrench = False
+        else:
+            self._limit_net_wrench()
 
     def _limit_net_wrench(self):
         pos = self.asset.data.body_pos_w[:, self.force_apply_idx_asset]
@@ -496,17 +818,58 @@ class StandingImpedanceCommand(Command):
 
     @observation
     def command(self):
+        if self.threshold_following:
+            # Both actors consume this group. Unknown-load-derived targets
+            # belong only in priv; adapt cannot remove ordinary actor inputs.
+            return self.safe_force_limit
         keypoint_b = self.force_keypoint_b.reshape(self.num_envs, -1)
         return torch.cat([keypoint_b, self.safe_force_limit], dim=-1)
 
     def command_sym(self):
+        if self.threshold_following:
+            return sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1])
         return sym_utils.SymmetryTransform.cat([
             sym_utils.cartesian_space_symmetry(self.asset, [self.asset.body_names[i] for i in self.force_apply_idx_asset], sign=[1, -1, 1]),
             sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1]),
         ])
 
     @observation
+    def yield_command(self):
+        """Known task command, not a sensorless force estimate.
+
+        Include heading error so the policy can correct accumulated yaw, not
+        merely stop yaw rate after it has already turned away.
+        """
+        velocity_b = quat_apply_inverse(self.asset.data.root_quat_w, self.root_vel_ref_w)
+        heading = self._heading_error()
+        return torch.cat([velocity_b, torch.cos(heading), torch.sin(heading)], dim=-1)
+
+    def yield_command_sym(self):
+        return sym_utils.SymmetryTransform(perm=torch.arange(5), signs=[1, -1, 1, 1, -1])
+
+    @observation
+    def heading_command(self):
+        # Relative to the episode's initial heading; independent of unknown
+        # force. Deployment can compute this from its orientation estimator.
+        heading = self._heading_error()
+        return torch.cat([torch.cos(heading), torch.sin(heading)], dim=-1)
+
+    def heading_command_sym(self):
+        return sym_utils.SymmetryTransform(perm=torch.arange(2), signs=[1, -1])
+
+    @observation
     def force_priv(self):
+        if self.threshold_following:
+            root_quat = self.asset.data.root_quat_w
+            return torch.cat([
+                self.force_keypoint_b.reshape(self.num_envs, -1),
+                self.admit.v[0].reshape(self.num_envs, -1),
+                self.force_applied_b.reshape(self.num_envs, -1),
+                self.force_expected_b.reshape(self.num_envs, -1),
+                quat_apply_inverse(root_quat, self.root_vel_ref_w),
+                quat_apply_inverse(root_quat, self.follow_input_force_w),
+                quat_apply_inverse(root_quat, self.follow_excess_force_w),
+            ], dim=-1)
         return torch.cat([
             self.force_keypoint_b.reshape(self.num_envs, -1),
             self.force_applied_b.reshape(self.num_envs, -1),
@@ -516,6 +879,12 @@ class StandingImpedanceCommand(Command):
         ], dim=-1)
 
     def force_priv_sym(self):
+        if self.threshold_following:
+            return sym_utils.SymmetryTransform.cat([
+                sym_utils.cartesian_space_symmetry(self.asset,
+                    [self.asset.body_names[i] for i in self.force_apply_idx_asset], sign=[1, -1, 1]).repeat(4),
+                sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, 1]).repeat(3),
+            ])
         return sym_utils.SymmetryTransform.cat([
             sym_utils.cartesian_space_symmetry(self.asset, [self.asset.body_names[i] for i in self.force_apply_idx_asset], sign=[1, -1, 1]).repeat(3),
             sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, 1]),
@@ -538,22 +907,36 @@ class StandingImpedanceCommand(Command):
 
     @reward
     def force_target_tracking(self):
-        error = (self.asset.data.body_pos_w[:, self.force_apply_idx_asset] - self.force_keypoint_w).norm(dim=-1).mean(dim=-1, keepdim=True)
+        target = self._reward_value("hand_position", self.force_keypoint_w)
+        error = (self.asset.data.body_pos_w[:, self.force_apply_idx_asset] - target).norm(dim=-1).mean(dim=-1, keepdim=True)
         return _exp_error(error, 0.08)
 
     @reward
     def force_target_vel_tracking(self):
-        error = (self.asset.data.body_lin_vel_w[:, self.force_apply_idx_asset] - self.force_keypoint_vel_w).norm(dim=-1).mean(dim=-1, keepdim=True)
+        target = self._reward_value("hand_velocity", self.force_keypoint_vel_w)
+        error = (self.asset.data.body_lin_vel_w[:, self.force_apply_idx_asset] - target).norm(dim=-1).mean(dim=-1, keepdim=True)
         return _exp_error(error, 0.5)
 
     @reward
     def force_reward(self):
-        error = (self.force_applied_w - self.force_expected_w).norm(dim=-1).mean(dim=-1, keepdim=True)
+        errors = (self.force_applied_w - self._reward_value("expected", self.force_expected_w)).norm(dim=-1)
+        if self.following_rewards:
+            error = self._active_force_mean(errors)
+            valid = self._reward_value("enabled", self.force_enable).any(dim=1)
+            if self.threshold_following:
+                valid = valid & ~self._reward_value("constant", self._constant_mask()).unsqueeze(-1)
+            return _exp_error(error, 4.0), valid
+        error = errors.mean(dim=-1, keepdim=True)
         return _exp_error(error, 8.0)
 
     @reward
     def force_exd_penalty(self):
-        excess = (self.force_applied_w.norm(dim=-1) - self.safe_force_limit).clamp_min(0.0)
+        excess = (self.force_applied_w.norm(dim=-1) - self._reward_value("safe", self.safe_force_limit)).clamp_min(0.0)
+        if self.following_rewards:
+            valid = self._reward_value("enabled", self.force_enable).any(dim=1)
+            if self.threshold_following:
+                valid = valid & ~self._reward_value("constant", self._constant_mask()).unsqueeze(-1)
+            return -self._active_force_mean(excess) / 10.0, valid
         return -excess.mean(dim=-1, keepdim=True) / 10.0
 
     @reward
@@ -571,15 +954,73 @@ class StandingImpedanceCommand(Command):
         if self.lower_joint_ids.numel() == 0:
             return torch.ones(self.num_envs, 1, device=self.device)
         error = (self.asset.data.joint_pos[:, self.lower_joint_ids] - self.init_joint_pos[:, self.lower_joint_ids]).abs().mean(dim=-1, keepdim=True)
-        return _exp_error(error, 0.35)
+        score = _exp_error(error, 0.35)
+        # Keep nominal posture as an idle objective; let the legs articulate
+        # while a nonzero translation command is being tracked.
+        return score * (1.0 - 0.9 * self._moving().float()) if self.following_rewards else score
 
     @reward
     def body_yield_velocity(self):
+        speed = self.asset.data.root_lin_vel_w[:, :2]
+        target = self._reward_value("velocity", self.root_vel_ref_w)[:, :2]
+        error = (speed - target).norm(dim=-1, keepdim=True)
+        if self.following_rewards:
+            score = torch.exp(-(error / self.tracking_sigma).square())
+            if self.threshold_following:
+                score *= self._balance_factor()
+            return score, self._moving()
         force = self.force_expected_w.sum(dim=1)
         force_xy = force[:, :2]
-        speed = self.asset.data.root_lin_vel_w[:, :2]
-        target = self.root_vel_ref_w[:, :2]
         force_active = (force_xy.norm(dim=-1, keepdim=True) > 1.0).float()
-        error = (speed - target).norm(dim=-1, keepdim=True)
         return force_active * _exp_error(error, 0.35) + (1.0 - force_active) * _exp_error(speed.norm(dim=-1, keepdim=True), 0.20)
+
+    @reward
+    def body_rest_velocity(self):
+        speed = self.asset.data.root_lin_vel_w[:, :2].norm(dim=-1, keepdim=True)
+        return torch.exp(-(speed / 0.08).square()), ~self._moving()
+
+    def _balance_factor(self):
+        height_error = (self.asset.data.root_pos_w[:, 2:3] - self.root_height_ref).abs()
+        tilt = self.asset.data.projected_gravity_b[:, :2].norm(dim=-1, keepdim=True)
+        return torch.exp(-(height_error / 0.10).square() - (tilt / 0.35).square())
+
+    @reward
+    def body_velocity_error(self):
+        # A dense Huber cost still distinguishes progress when the exponential
+        # tracking score is near zero. Applies during braking and at rest too.
+        target = self._reward_value("velocity", self.root_vel_ref_w)[:, :2]
+        error = (self.asset.data.root_lin_vel_w[:, :2] - target).norm(dim=-1, keepdim=True) / 0.20
+        return -torch.where(error < 1.0, 0.5 * error.square(), error - 0.5)
+
+    @reward
+    def body_yield_stall(self):
+        target = self._reward_value("velocity", self.root_vel_ref_w)[:, :2]
+        progress = (self.asset.data.root_lin_vel_w[:, :2] * target).sum(-1, keepdim=True)
+        progress = progress / target.square().sum(-1, keepdim=True).clamp_min(1e-6)
+        # Zero speed costs one; reverse motion costs up to two. Overspeed is
+        # handled by the vector tracking score rather than rewarded here.
+        return -(1.0 - progress).clamp(0.0, 2.0), self._moving()
+
+    @reward
+    def body_heading_tracking(self):
+        return torch.exp(-(self._heading_error() / 0.25).square())
+
+    @reward
+    def body_yaw_rate(self):
+        return -self.asset.data.root_ang_vel_w[:, 2:3].square().clamp_max(9.0)
+
+    @reward
+    def yield_step_air_time(self):
+        touchdown = self.contact_sensor.compute_first_contact(self.env.step_dt)[:, self.foot_sensor_ids]
+        air_time = self.contact_sensor.data.last_air_time[:, self.foot_sensor_ids]
+        target = self._reward_value("velocity", self.root_vel_ref_w)[:, :2]
+        progress = (self.asset.data.root_lin_vel_w[:, :2] * target).sum(-1, keepdim=True)
+        progress = progress / target.square().sum(-1, keepdim=True).clamp_min(1e-6)
+        # Reward short steps only when translating in the commanded direction.
+        # Merely hopping or standing on one leg does not earn this term.
+        score = ((air_time - 0.12).clamp(0.0, 0.25) * touchdown).sum(-1, keepdim=True)
+        score = score * progress.clamp(0.0, 1.0)
+        if self.threshold_following:
+            score *= self._balance_factor()
+        return score, self._moving()
 

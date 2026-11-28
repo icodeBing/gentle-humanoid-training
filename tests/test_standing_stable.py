@@ -30,12 +30,27 @@ def tensor_command():
             exec(compile(ast.Module(body=[node], type_ignores=[]), "math.py", "exec"), namespace)
     tree = ast.parse((COMMANDS / "standing_impedance.py").read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "StandingImpedanceCommand")
+    exp_error = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_exp_error")
+    exec(compile(ast.Module(body=[exp_error], type_ignores=[]), "standing_impedance.py", "exec"), namespace)
     methods = {}
     names = {"set_eval_force_schedule", "set_eval_stable_force", "set_eval_spring",
              "_is_stable_replay", "_stable_force_w", "_update_eval_schedule",
-             "before_update", "step", "_current_hand_b", "_limit_net_wrench"}
+             "before_update", "step", "_current_hand_b", "_limit_net_wrench",
+             "_bound_hand_reference", "_sample_offset", "_sample_force", "_moving",
+             "_active_force_mean", "_heading_error", "body_yield_velocity",
+             "body_rest_velocity", "body_yield_stall", "body_heading_tracking",
+             "body_yaw_rate", "force_reward", "force_exd_penalty", "stand_lower_body",
+             "yield_step_air_time", "yield_command", "_accumulate_tracking_metrics",
+             "tracking_diagnostics"}
+    names.add("_sample_active_mask")
+    names.update({"_constant_mask", "_constant_load_w", "_physical_load_w",
+                  "_update_body_reference", "_sample_constant_magnitude", "step_schedule",
+                  "_update_mixed_schedule", "_update_schedule", "_balance_factor",
+                  "body_velocity_error", "command", "_reward_value",
+                  "force_target_tracking", "force_target_vel_tracking", "heading_command", "force_priv"})
     for node in cls.body:
         if isinstance(node, ast.FunctionDef) and node.name in names:
+            node.decorator_list = []
             exec(compile(ast.Module(body=[node], type_ignores=[]), "standing_impedance.py", "exec"), namespace)
             methods[node.name] = namespace[node.name]
     return type("TensorStanding", (), methods)
@@ -46,7 +61,8 @@ TensorStanding = tensor_command()
 
 def force_helpers():
     namespace = dict(np=np, csv=csv)
-    names = {"_force_reference_snapshot", "_force_snapshot", "_force_record_rows", "_write_force_csv"}
+    names = {"_force_reference_snapshot", "_force_snapshot", "_force_record_rows", "_write_force_csv",
+             "_following_motion_fields", "_following_reference_snapshot"}
     tree = ast.parse((ROOT / "scripts/utils/helpers.py").read_text())
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in names:
@@ -68,6 +84,7 @@ def make_command(magnitude=10., direction=(1., 0., 0.), bodies=None, **schedule)
         root_lin_vel_w=torch.zeros(1, 3), body_pos_w=torch.zeros(1, 7, 3),
         body_quat_w=torch.tensor([1., 0., 0., 0.]).expand(1, 7, 4).clone(),
         projected_gravity_b=torch.tensor([[0., 0., -1.]]),
+        root_ang_vel_w=torch.zeros(1, 3), body_lin_vel_w=torch.zeros(1, 7, 3),
     )
     c.env = SimpleNamespace(step_dt=.02)
     c.force_apply_idx_asset = torch.arange(6)
@@ -75,12 +92,13 @@ def make_command(magnitude=10., direction=(1., 0., 0.), bodies=None, **schedule)
     for name in ["nominal_hand_b", "force_origin_b", "force_dir_b", "force_keypoint_b",
                  "force_keypoint_w", "force_keypoint_vel_w", "force_keypoint_w_prev",
                  "force_applied_w", "force_applied_b", "force_expected_w", "force_expected_b",
-                 "force_pos_delta", "force_interact_b", "force_interact_w"]:
+                 "force_pos_delta", "force_interact_b", "force_interact_w", "force_drive_b", "force_drive_w"]:
         setattr(c, name, torch.zeros(1, 6, 3))
     c.force_apply_buffer = torch.zeros(1, 7, 3)
     c.torque_apply_buffer = torch.zeros_like(c.force_apply_buffer)
     c.force_kp_nominal = torch.full((1, 6, 1), 100.)
     c.force_kp = c.force_kp_nominal.clone()
+    c.force_offset = torch.full((1, 1, 1), .2)
     c.force_enable = torch.zeros(1, 6, 1, dtype=torch.bool)
     c.force_scale = torch.zeros(1, 1)
     c.eval_force_body_mask = torch.ones(6, dtype=torch.bool)
@@ -96,6 +114,31 @@ def make_command(magnitude=10., direction=(1., 0., 0.), bodies=None, **schedule)
     c.net_force_limit, c.net_torque_limit = torch.tensor(60.), torch.tensor(35.)
     c.body_mass, c.body_damping = 35., 45.
     c.body_acc_limit, c.body_vel_limit = 2., .8
+    c.following_rewards = False
+    c.threshold_following = False
+    c._reward_reference = {}
+    c._reward_reference_valid = torch.zeros(1, dtype=torch.bool)
+    c.constant_load_probability = .5
+    c.constant_excess_range = (2., 20.)
+    c.load_curriculum_fraction = .25
+    c.student_train = False
+    c.load_curriculum_scale = 1.
+    c.load_is_constant = torch.zeros(1, dtype=torch.bool)
+    c.constant_force_w = torch.zeros(1, 6, 3)
+    c.follow_input_force_w = torch.zeros(1, 3)
+    c.follow_excess_force_w = torch.zeros(1, 3)
+    c.load_age = torch.zeros(1, dtype=torch.long)
+    c.load_ramp_steps = torch.ones(1, dtype=torch.long)
+    c.load_hold_steps = torch.ones(1, dtype=torch.long)
+    c.hand_reference_limit = None
+    c.hand_offset_range = None
+    c.hand_offset_random_prob = .5
+    c.force_body_sampling = "independent"
+    c.hand_force_indices = [4, 5]
+    c.tracking_sigma, c.moving_speed_threshold, c.tracking_tolerance = .1, .05, .05
+    c.heading_ref_w = torch.tensor([[1., 0., 0.]])
+    c.metric_sums = torch.zeros(16)
+    c.threshold_metric_sums = torch.zeros(6)
     c.admit = admittance.AdmittanceMassChain(1, 6, .005, 1, "cpu", mass=.1,
                                             damping=2., vel_clip=4., acc_clip=1000.)
     c.set_eval_force_schedule("stable", **schedule)

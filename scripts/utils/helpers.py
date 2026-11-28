@@ -231,6 +231,11 @@ def _force_reference_snapshot(base_env, env_index: int | None = None):
         result["limit"] = float(command.safe_force_limit[env_index].reshape(-1)[0])
     else:
         result["limit"] = float("nan")
+    if getattr(command, "threshold_following", False):
+        for key, attr in [("hand_pos_ref", "force_keypoint_w"),
+                          ("hand_vel_ref", "force_keypoint_vel_w"),
+                          ("hand_drive", "force_drive_w")]:
+            result[key] = getattr(command, attr)[env_index].detach().float().cpu().numpy().copy()
     return result
 
 
@@ -286,6 +291,10 @@ def _force_snapshot(base_env, env_index: int | None = None, reference=None):
         "limit": limit,                                                      # scalar
         "names": names,
     }
+    if reference is not None and "hand_pos_ref" in reference:
+        snap.update({key: reference[key] for key in ["hand_pos_ref", "hand_vel_ref", "hand_drive"]})
+        snap["hand_pos_actual"] = positions.copy()
+        snap["hand_vel_actual"] = command.asset.data.body_lin_vel_w[env_index, indices].detach().float().cpu().numpy().copy()
     if getattr(command, "eval_force_schedule", None) is not None:
         snap["root_velocity"] = command.asset.data.root_lin_vel_w[env_index].detach().float().cpu().numpy()
         snap["root_velocity_ref"] = command.root_vel_ref_w[env_index].detach().float().cpu().numpy()
@@ -484,6 +493,16 @@ def _force_record_rows(snap, step: int, step_dt: float, physics_dt: float):
                                               if snap["interact"] is not None else float("nan")),
                    interact_reference_time_s=(round(interval_start + 3 * physics_dt, 6)
                                               if snap["interact"] is not None else float("nan")))
+        if "hand_pos_ref" in snap:
+            for label, key, unit in [("hand_pos_actual", "hand_pos_actual", "m"),
+                                      ("hand_pos_ref", "hand_pos_ref", "m"),
+                                      ("hand_vel_actual", "hand_vel_actual", "m_s"),
+                                      ("hand_vel_ref", "hand_vel_ref", "m_s"),
+                                      ("f_drive_ref", "hand_drive", "N")]:
+                row.update({f"{label}_{axis}_{unit}": float(value)
+                            for axis, value in zip("xyz", snap[key][m])})
+            row["hand_position_error_m"] = float(np.linalg.norm(snap["hand_pos_actual"][m] - snap["hand_pos_ref"][m]))
+            row["hand_velocity_error_m_s"] = float(np.linalg.norm(snap["hand_vel_actual"][m] - snap["hand_vel_ref"][m]))
         rows.append(row)
     return rows
 
@@ -493,6 +512,55 @@ def _write_force_csv(path: str, records):
         writer = csv.DictWriter(f, fieldnames=list(records[0]))
         writer.writeheader()
         writer.writerows(records)
+
+
+def _following_reference_snapshot(command):
+    """Hold load/threshold metadata with the velocity command used by physics."""
+    return dict(
+        input_force=command.follow_input_force_w.detach().clone(),
+        excess_force=command.follow_excess_force_w.detach().clone(),
+        safe=command.safe_force_limit.detach().clone(),
+        constant=command._constant_mask().detach().clone(),
+    )
+
+
+def _following_motion_fields(command, env_index, velocity_reference, reference=None):
+    """Physical replay diagnostics using the command held during this step."""
+    data = command.asset.data
+    speed = data.root_lin_vel_w[env_index, :2]
+    target = velocity_reference[:2]
+    target_speed = float(target.norm())
+    error = float((speed - target).norm())
+    progress = float((speed * target).sum() / target.square().sum().clamp_min(1e-6))
+    moving = target_speed > command.moving_speed_threshold
+    contact = command.contact_sensor.data.current_contact_time[env_index, command.foot_sensor_ids] > 0
+    foot_speed = data.body_lin_vel_w[env_index, command.foot_asset_ids, :2].norm(dim=-1)
+    result = dict(
+        moving_target=int(moving), target_speed_xy_m_s=target_speed,
+        actual_speed_xy_m_s=float(speed.norm()), velocity_error_xy_m_s=error,
+        progress_ratio=progress if moving else float("nan"),
+        tracking_ok=int(moving and error < command.tracking_tolerance and progress >= 0.8),
+        heading_error_rad=float(command._heading_error()[env_index, 0]),
+        spring_offset_m=float(command.force_offset[env_index].reshape(-1)[0]),
+    )
+    if reference is not None:
+        for label, key in [("follow_input", "input_force"), ("follow_excess", "excess_force")]:
+            result.update({f"{label}_{axis}_N": float(value)
+                           for axis, value in zip("xyz", reference[key][env_index].tolist())})
+        result["safe_force_N"] = float(reference["safe"][env_index, 0])
+        result["constant_load"] = int(reference["constant"][env_index])
+        result["over_safe"] = int(reference["input_force"][env_index, :2].norm() > reference["safe"][env_index, 0])
+        balance = float(command._balance_factor()[env_index, 0])
+        result["balance_factor"] = balance
+        # Stronger acceptance metric; retain tracking_ok for legacy comparisons.
+        result["balanced_tracking_ok"] = int(result["tracking_ok"] and balance > 0.8
+                                              and abs(result["heading_error_rad"]) < 0.25)
+    for j, body_id in enumerate(command.foot_asset_ids):
+        name = str(command.asset.body_names[body_id]).replace("_link", "")
+        result[f"{name}_contact"] = int(contact[j])
+        result[f"{name}_speed_xy_m_s"] = float(foot_speed[j])
+        result[f"{name}_height_m"] = float(data.body_pos_w[env_index, body_id, 2])
+    return result
 
 
 @torch.inference_mode()
@@ -558,6 +626,9 @@ def evaluate(
     torch.compiler.cudagraph_mark_step_begin()
     with set_exploration_type(exploration_type):
         for i in tqdm(range(env.max_episode_length), miniters=10):
+            motion_reference = command.root_vel_ref_w.detach().clone() if settle_replay else None
+            following_reference = (_following_reference_snapshot(command)
+                                   if settle_replay and getattr(command, "threshold_following", False) else None)
             force_reference = (_force_reference_snapshot(env.base_env)
                                if settle_replay and render and show_force else None)
             s = time.perf_counter()
@@ -582,7 +653,7 @@ def evaluate(
                 for label, tensor, unit in [
                     ("root_pos", data.root_pos_w, "m"),
                     ("root_vel", data.root_lin_vel_w, "m_s"),
-                    ("root_vel_ref", command.root_vel_ref_w, "m_s"),
+                    ("root_vel_ref", motion_reference, "m_s"),
                     ("root_ang_vel", data.root_ang_vel_w, "rad_s"),
                 ]:
                     values = tensor[index].detach().float().cpu().tolist()
@@ -591,6 +662,8 @@ def evaluate(
                 q = data.root_quat_w[index].detach().float().cpu().numpy()
                 row["root_yaw_rad"] = float(np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
                                                         1 - 2 * (q[2] ** 2 + q[3] ** 2)))
+                if getattr(command, "following_rewards", False):
+                    row.update(_following_motion_fields(command, index, motion_reference[index], following_reference))
                 motion_records.append(row)
             trajs.append(tensordict.select(*keys, strict=False).cpu())
             if render:

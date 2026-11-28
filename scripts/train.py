@@ -189,6 +189,9 @@ def main(cfg: DictConfig):
             info.update(train_carry)
             info.update(env.extra)
             info.update(env.stats_ema)
+            diagnostics = getattr(env.command_manager, "tracking_diagnostics", None)
+            if diagnostics is not None:
+                info.update(diagnostics())
 
             info["env_frames"] = env_frames * aa.get_world_size()
             info["rollout_fps"] = data.numel() / rollout_time * aa.get_world_size()
